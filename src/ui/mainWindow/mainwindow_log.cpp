@@ -12,6 +12,9 @@
 
 #include "3rdparty/qv2ray/v2/ui/LogHighlighter.hpp"
 
+#include <QFile>
+#include <QTextStream>
+
 namespace {
     // Bypasses QTextEdit::append()'s per-call layout/scroll work, which dominates
     // when the core spams lines; one edit block per batch instead.
@@ -45,6 +48,15 @@ void MainWindow::append_log(const QString &log) {
         append_log(QString("TRUNCATED LONG LOG: ") + log.first(1000) + "...");
         return;
     }
+    
+    if (qApp->arguments().contains("-debug")) {
+        QFile f("throne-debug.log");
+        if (f.open(QIODevice::Append | QIODevice::Text)) {
+            QTextStream(&f) << log << "\n";
+            f.close();
+        }
+    }
+
     QMutexLocker locker(&logMutex);
     if (logQueue.size() > 1000) {
         // log is overloaded, just discard it

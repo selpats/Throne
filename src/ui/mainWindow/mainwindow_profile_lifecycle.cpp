@@ -172,7 +172,7 @@ bool MainWindow::handleXrayGeoAssetError(const QString& error, const QString& co
     return true;
 }
 
-void MainWindow::profile_start(int _id) {
+void MainWindow::profile_start(int _id, bool is_retry) {
     if (Configs::dataManager->settingsRepo->prepare_exit) return;
 #ifdef Q_OS_LINUX
     if (Configs::dataManager->settingsRepo->enable_dns_server && Configs::dataManager->settingsRepo->dns_server_listen_port <= 1024) {
@@ -280,6 +280,13 @@ void MainWindow::profile_start(int _id) {
                 return false;
             }
             if (error.contains("configure tun interface")) {
+                if (error.contains("Cannot create a file when that file already exists") && !is_retry) {
+                    MW_show_log(tr("TUN adapter is being cleaned up by the OS, retrying in 2 seconds..."));
+                    QTimer::singleShot(2000, this, [=, this]() {
+                        profile_start(_id, true);
+                    });
+                    return false;
+                }
                 runOnUiThread([=, this] {
 
                     QMessageBox msg(
@@ -382,11 +389,7 @@ void MainWindow::profile_start(int _id) {
         return; // let CoreProcess call profile_start when core is up
     }
 
-    // timeout message
-    const auto restartMsgbox = new QMessageBox(QMessageBox::Question, software_name, tr("If there is no response for a long time, it is recommended to restart the software."),
-                                         QMessageBox::Yes | QMessageBox::No, this);
-    connect(restartMsgbox, &QMessageBox::accepted, this, [=,this] { MW_dialog_message(MwMessage::RestartProgram, {}); });
-    const auto restartMsgboxTimer = new MessageBoxTimer(this, restartMsgbox, 10000);
+
 
     // Show the "Connecting" state until the start resolves below.
     runOnUiThread([this] {
@@ -409,9 +412,7 @@ void MainWindow::profile_start(int _id) {
         mu_starting.unlock();
         // cancel timeout
         runOnUiThread([=, this] {
-            restartMsgboxTimer->cancel();
-            restartMsgboxTimer->deleteLater();
-            restartMsgbox->deleteLater();
+
             // Start has resolved (success or failure); leave the Connecting state.
             m_profileConnecting = false;
             refresh_startstop_button();
@@ -471,16 +472,7 @@ void MainWindow::profile_stop(bool crash, bool block, bool manual) {
         Stats::trafficLooper->PersistTraffic();
         Stats::trafficStatsManager->Flush();
 
-        // Null until the blocking hop assigns them: runOnUiThread is a no-op before qApp
-        // exists, and the teardown must not chase an uninitialized pointer.
-        QMessageBox* restartMsgbox = nullptr;
-        MessageBoxTimer* restartMsgboxTimer = nullptr;
-        runOnUiThread([=, this, &restartMsgbox, &restartMsgboxTimer] {
-            restartMsgbox = new QMessageBox(QMessageBox::Question, software_name, tr("If there is no response for a long time, it is recommended to restart the software."),
-                             QMessageBox::Yes | QMessageBox::No, this);
-            connect(restartMsgbox, &QMessageBox::accepted, this, [=, this] { MW_dialog_message(MwMessage::RestartProgram, {}); });
-            restartMsgboxTimer = new MessageBoxTimer(this, restartMsgbox, 5000);
-        }, true);
+
 
         // do stop. Snapshot the profile: `running` is cleared below and can also
         // be reassigned by a start racing this teardown.
@@ -495,13 +487,7 @@ void MainWindow::profile_stop(bool crash, bool block, bool manual) {
         if (manual) Configs::dataManager->settingsRepo->UpdateStartedId(Configs::NoProfileId);
         running = nullptr;
 
-        runOnUiThread([=, this, &restartMsgboxTimer, &restartMsgbox] {
-            if (restartMsgboxTimer != nullptr) {
-                restartMsgboxTimer->cancel();
-                restartMsgboxTimer->deleteLater();
-            }
-            if (restartMsgbox != nullptr) restartMsgbox->deleteLater();
-
+        runOnUiThread([=, this] {
             m_profileDisconnecting = false;
             refresh_status();
             refresh_proxy_list({id});

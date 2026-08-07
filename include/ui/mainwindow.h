@@ -104,7 +104,7 @@ public:
 
     void update_traffic_graph(int proxyDl, int proxyUp, int directDl, int directUp);
 
-    void profile_start(int _id = -1);
+    void profile_start(int _id = -1, bool is_retry = false);
 
     void profile_stop(bool crash = false, bool block = false, bool manual = false);
 
