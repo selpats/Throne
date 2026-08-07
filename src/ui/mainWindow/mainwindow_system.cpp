@@ -121,7 +121,7 @@ void MainWindow::prepare_exit()
     on_commitDataRequest();
     //
     Configs::dataManager->settingsRepo->noSave = true; // don't change Configs::dataManager->settingsRepo after this line
-    profile_stop(false, true);
+    profile_stop(true, false);
 
     runOnThread([=, this]()
     {
