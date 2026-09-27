@@ -169,7 +169,7 @@ bool MainWindow::handleXrayGeoAssetError(const QString& error, const QString& co
     return true;
 }
 
-void MainWindow::profile_start(int _id) {
+void MainWindow::profile_start(int _id, bool is_retry) {
     if (Configs::dataManager->settingsRepo->prepare_exit) return;
 #ifdef Q_OS_LINUX
     if (Configs::dataManager->settingsRepo->enable_dns_server && Configs::dataManager->settingsRepo->dns_server_listen_port <= 1024) {
@@ -274,6 +274,13 @@ void MainWindow::profile_start(int _id) {
                 return false;
             }
             if (error.contains("configure tun interface")) {
+                if (error.contains("Cannot create a file when that file already exists") && !is_retry) {
+                    MW_show_log(tr("TUN adapter is being cleaned up by the OS, retrying in 2 seconds..."));
+                    QTimer::singleShot(2000, this, [=, this]() {
+                        profile_start(_id, true);
+                    });
+                    return false;
+                }
                 runOnUiThread([=, this] {
 
                     QMessageBox msg(
@@ -383,8 +390,7 @@ void MainWindow::profile_start(int _id) {
         return;
     }
 
-    const QPointer<RestartPrompt> restartPrompt =
-        new RestartPrompt(this, tr("If there is no response for a long time, it is recommended to restart the software."), 10000);
+    const QPointer<RestartPrompt> restartPrompt = nullptr;
 
     runOnUiThread([this] {
         m_profileConnecting = true;
@@ -461,11 +467,7 @@ void MainWindow::profile_stop(bool crash, bool block, bool manual) {
         Stats::trafficLooper->PersistTraffic();
         Stats::trafficStatsManager->Flush();
 
-        // runOnUiThread is a no-op before qApp exists, so the teardown must not chase this.
-        QPointer<RestartPrompt> restartPrompt;
-        runOnUiThread([this, &restartPrompt] {
-            restartPrompt = new RestartPrompt(this, tr("If there is no response for a long time, it is recommended to restart the software."), 5000);
-        }, true);
+        QPointer<RestartPrompt> restartPrompt = nullptr;
 
         // Snapshot: `running` is cleared below and a racing start can reassign it.
         const auto stopping = running;

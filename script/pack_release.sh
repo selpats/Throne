@@ -16,8 +16,8 @@ mkdir -p "$WORK/logs" "$DEPLOY"
 untar() {
     local glob="$1"
     shift
-    find download-artifact -path "*/Throne-*-$glob/artifacts.tgz" -not -path '*-Common-*' -print0 |
-        xargs -0 -r -I{} -P "$JOBS" tar xzf {} "$@"
+    find download-artifact -name 'artifacts.tgz' -not -path '*-Common-*' -print0 |
+        xargs -0 -r -I{} tar xzf {} "$@"
 }
 
 build_installer() {
@@ -34,7 +34,7 @@ build_installer() {
         "/DAppVersionPatch=${parts[2]:-0}" \
         "/DAppVersionBuild=${parts[3]:-0}" \
         "/O$(cygpath -w "$DEPLOY")" \
-        "/FThrone-$TAG-windows-universal-installer" \
+        "/FThrone-$TAG-windows-amd64-installer" \
         "$(cygpath -w "$ROOT/script/windows_installer.iss")"
 }
 
@@ -91,9 +91,6 @@ windows)
     TASKS=(
         "installer build_installer"
         "zip-windows64 zip_dir windows-amd64 windows64"
-        "zip-windows-arm64 zip_dir windows-arm64 windows-arm64"
-        "zip-windows32 zip_dir windowslegacy-386 windows32"
-        "zip-windowslegacy64 zip_dir windowslegacy-amd64 windowslegacy64"
     )
     ;;
 linux-amd64 | linux-arm64)

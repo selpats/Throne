@@ -36,6 +36,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 DefaultDirName={code:DefaultInstallDir}
 DirExistsWarning=no
 DisableProgramGroupPage=yes
+ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=win64
 CloseApplications=force
 RestartApplications=no
@@ -52,10 +53,7 @@ LZMABlockSize=118784
 SelectDirBrowseLabel=To continue, click Next. If the folder you choose is not named Throne, Setup creates a Throne folder inside it, so uninstalling only ever removes Throne's own folder.
 
 [Files]
-Source: "deployment\windows-amd64\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion; Check: IsX64OS; MinVersion: 10.0.17763
-Source: "deployment\windowslegacy-amd64\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion; Check: IsX64OS; OnlyBelowVersion: 10.0.17763
-Source: "deployment\windows-arm64\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion; Check: IsArm64
-Source: "deployment\windowslegacy-386\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion; Check: IsX86OS
+Source: "deployment\windows-amd64\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Throne"; Filename: "{app}\Throne.exe"
