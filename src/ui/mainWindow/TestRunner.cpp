@@ -292,20 +292,20 @@ void TestRunner::runIpProbe(const Target& target) {
     }
 }
 
-void TestRunner::runUrlTests(const QList<int>& profileIDs, const std::function<void()>& onFinished) {
-    runLatencyGroup(LatencyKind::Url, profileIDs, onFinished);
+bool TestRunner::runUrlTests(const QList<int>& profileIDs, const std::function<void()>& onFinished, bool interactive) {
+    return runLatencyGroup(LatencyKind::Url, profileIDs, onFinished, false, interactive);
 }
 
 void TestRunner::queueUrlTests(const QList<int>& profileIDs, const std::function<void()>& onFinished) {
     runOnNewThread([=, this] { runLatencyGroup(LatencyKind::Url, profileIDs, onFinished, true); });
 }
 
-void TestRunner::runIpTests(const QList<int>& profileIDs) {
-    runLatencyGroup(LatencyKind::Ip, profileIDs, {});
+bool TestRunner::runIpTests(const QList<int>& profileIDs, const std::function<void()>& onFinished, bool interactive) {
+    return runLatencyGroup(LatencyKind::Ip, profileIDs, onFinished, false, interactive);
 }
 
-void TestRunner::runLatencyGroup(LatencyKind kind, const QList<int>& requestedIDs,
-                                 const std::function<void()>& onFinished, bool waitForSession) {
+bool TestRunner::runLatencyGroup(LatencyKind kind, const QList<int>& requestedIDs,
+                                 const std::function<void()>& onFinished, bool waitForSession, bool interactive) {
     const bool isUrl = kind == LatencyKind::Url;
     const auto panelKind = isUrl ? DataViewHtmlGenerator::LatencyTestPanelState::Kind::Url
                                  : DataViewHtmlGenerator::LatencyTestPanelState::Kind::Ip;
@@ -315,7 +315,7 @@ void TestRunner::runLatencyGroup(LatencyKind kind, const QList<int>& requestedID
     const auto profileIDs = withoutAutoSelectors(requestedIDs);
     if (profileIDs.isEmpty()) {
         finish();
-        return;
+        return false;
     }
     if (waitForSession) {
         session_.lock();
@@ -324,15 +324,16 @@ void TestRunner::runLatencyGroup(LatencyKind kind, const QList<int>& requestedID
             ? MainWindow::tr("The last url test did not exit completely, please wait. If it persists, please restart the program.")
             : MainWindow::tr("The last test did not exit completely, please wait. If it persists, please restart the program.");
         // Auto-selector ranking calls in from a worker thread, where no widget may be created.
-        if (QThread::currentThread() == mw_->thread()) MessageBoxWarning(software_name, text);
+        if (interactive && QThread::currentThread() == mw_->thread()) MessageBoxWarning(software_name, text);
         else MW_show_log(text);
         finish();
-        return;
+        return false;
     }
     sessionGen_.fetch_add(1);
+    // Reset here, not on the worker: a stop() that lands before the worker runs must still count.
+    stopRequested_.store(false);
 
     runOnNewThread([this, profileIDs, panelKind, isUrl, finish]() {
-        stopRequested_.store(false);
         mw_->dataViewHtmlGenerator_.seedLatencyTest(panelKind, profileIDs.size());
         mw_->UpdateDataView(true);
 
@@ -406,25 +407,32 @@ void TestRunner::runLatencyGroup(LatencyKind kind, const QList<int>& requestedID
         }
         MW_show_log(isUrl ? MainWindow::tr("URL test finished!") : MainWindow::tr("IP test finished!"));
     });
+    return true;
 }
 
-void TestRunner::runSpeedTests(const QList<int>& requestedIDs, bool testCurrent)
+bool TestRunner::runSpeedTests(const QList<int>& requestedIDs, bool testCurrent,
+                               const std::function<void()>& onFinished, bool interactive)
 {
+    const auto finish = [onFinished] { if (onFinished) onFinished(); };
     // A live-connection test stays valid for a selector: it measures whichever member carries traffic.
     const auto profileIDs = testCurrent ? requestedIDs : withoutAutoSelectors(requestedIDs);
     if (profileIDs.isEmpty() && !testCurrent) {
-        return;
+        finish();
+        return false;
     }
     if (!session_.tryLock()) {
-        MessageBoxWarning(software_name, MainWindow::tr("The last test did not finish completely, please wait. If it persists, please restart the program."));
-        return;
+        const auto text = MainWindow::tr("The last test did not finish completely, please wait. If it persists, please restart the program.");
+        if (interactive) MessageBoxWarning(software_name, text);
+        else MW_show_log(text);
+        finish();
+        return false;
     }
     sessionGen_.fetch_add(1);
+    stopRequested_.store(false);
 
     testingCurrent_.store(testCurrent);
 
-    runOnNewThread([this, profileIDs, testCurrent]() {
-        stopRequested_.store(false);
+    runOnNewThread([this, profileIDs, testCurrent, finish]() {
         { QMutexLocker lk(&creditMu_); credited_.clear(); }
         if (!testCurrent)
         {
@@ -474,11 +482,13 @@ void TestRunner::runSpeedTests(const QList<int>& requestedIDs, bool testCurrent)
         mw_->dataViewHtmlGenerator_.clearTestSections();
         mw_->UpdateDataView(true);
         session_.unlock();
+        finish();
         runOnUiThread([=,this]{
             mw_->refresh_proxy_list(profileIDs);
             MW_show_log(MainWindow::tr("Speedtest finished!"));
         });
     });
+    return true;
 }
 
 void TestRunner::creditTraffic(const std::shared_ptr<Configs::Profile>& profile, const QString& tag, qint64 curUp, qint64 curDown)

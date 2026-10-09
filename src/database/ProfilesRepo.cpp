@@ -30,6 +30,7 @@ namespace Configs {
                 outbound_json TEXT NOT NULL,
                 traffic_dl INTEGER NOT NULL DEFAULT 0,
                 traffic_up INTEGER NOT NULL DEFAULT 0,
+                endpoint_json TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 FOREIGN KEY(gid) REFERENCES groups(id) ON DELETE CASCADE
@@ -38,6 +39,8 @@ namespace Configs {
 
         if (!profilesColumnExists("latency_at"))
             db.exec("ALTER TABLE profiles ADD COLUMN latency_at INTEGER NOT NULL DEFAULT 0");
+        if (!profilesColumnExists("endpoint_json"))
+            db.exec("ALTER TABLE profiles ADD COLUMN endpoint_json TEXT NOT NULL DEFAULT '{}'");
 
         db.exec("CREATE INDEX IF NOT EXISTS idx_profiles_name ON profiles(name)");
     }
@@ -64,6 +67,7 @@ namespace Configs {
         profile->ul_speed = json["ul_speed"].toString();
         profile->test_country = json["test_country"].toString();
         profile->ip_out = json["ip_out"].toString();
+        profile->endpoint = EndpointSource::FromJson(json["endpoint"].toObject());
         
         QString type = profile->type;
         if (type == "hysteria2") {
@@ -94,12 +98,13 @@ namespace Configs {
             outboundJson = QString::fromUtf8(outboundDoc.toJson(QJsonDocument::Compact));
         }
         QString name = profile->outbound ? profile->outbound->name : QString();
+        QString endpointJson = QString::fromUtf8(QJsonDocument(profile->endpoint.ToJson()).toJson(QJsonDocument::Compact));
 
         db.exec(R"(
             INSERT INTO profiles
             (id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country,
-            ip_out, outbound_json, traffic_dl, traffic_up)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 type = excluded.type, name = excluded.name, gid = excluded.gid,
                 latency = excluded.latency, latency_at = excluded.latency_at,
@@ -107,6 +112,7 @@ namespace Configs {
                 test_country = excluded.test_country, ip_out = excluded.ip_out,
                 outbound_json = excluded.outbound_json,
                 traffic_dl = excluded.traffic_dl, traffic_up = excluded.traffic_up,
+                endpoint_json = excluded.endpoint_json,
                 updated_at = strftime('%s', 'now')
         )",
             id,
@@ -121,7 +127,8 @@ namespace Configs {
             profile->ip_out.toStdString(),
             outboundJson.toStdString(),
             static_cast<long long>(profile->traffic_downlink),
-            static_cast<long long>(profile->traffic_uplink)
+            static_cast<long long>(profile->traffic_uplink),
+            endpointJson.toStdString()
         );
     }
 
@@ -145,6 +152,7 @@ namespace Configs {
         row.outbound_json = outboundJson.toStdString();
         row.traffic_dl = static_cast<long long>(profile->traffic_downlink);
         row.traffic_up = static_cast<long long>(profile->traffic_uplink);
+        row.endpoint_json = QJsonDocument(profile->endpoint.ToJson()).toJson(QJsonDocument::Compact).toStdString();
         return row;
     }
 
@@ -169,6 +177,10 @@ namespace Configs {
 
         json["traffic_dl"] = static_cast<qint64>(stmt.getColumn(11).getInt64());
         json["traffic_up"] = static_cast<qint64>(stmt.getColumn(12).getInt64());
+        if (const auto endpointDoc = QJsonDocument::fromJson(QByteArray(stmt.getColumn(13).getText()));
+            endpointDoc.isObject()) {
+            json["endpoint"] = endpointDoc.object();
+        }
         
         return profileFromJson(json);
     }
@@ -176,7 +188,7 @@ namespace Configs {
     std::shared_ptr<Profile> ProfilesRepo::loadFromDatabase(int id) const {
         auto query = db.query(R"(
             SELECT id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country,
-                   ip_out, outbound_json, traffic_dl, traffic_up
+                   ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json
             FROM profiles WHERE id = ?
         )", id);
         if (!query || !query->executeStep()) {
@@ -270,7 +282,7 @@ namespace Configs {
             idList += QString::number(chunkIds[i]);
         }
         std::string sql = "SELECT id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country, "
-                         "ip_out, outbound_json, traffic_dl, traffic_up FROM profiles WHERE id IN (" +
+                         "ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json FROM profiles WHERE id IN (" +
                          idList.toStdString() + ") ORDER BY id";
         auto query = db.query(sql);
         if (!query) return result;

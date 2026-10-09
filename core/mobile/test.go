@@ -285,6 +285,9 @@ func StartURLTest(current *Instance, platform PlatformInterface, request *TestRe
 	}
 	// Held, not re-read: StopTests rearms a fresh context.
 	testCtx := probe.TestContext()
+	if request.TestCurrent {
+		testCtx = probe.LiveInstance(testCtx)
+	}
 	// A muxed config needs a warm connection; the live instance already is one.
 	twice := !request.TestCurrent
 	timeout := time.Duration(request.TimeoutMs) * time.Millisecond

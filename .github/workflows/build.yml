@@ -42,8 +42,9 @@ jobs:
       - name: Install Golang For Legacy OS
         if: steps.cache-common.outputs.cache-hit != 'true' && contains( matrix.cross_os, 'legacy' )
         run: |
-          curl -L -o go.zip https://github.com/throneproj/env_windows_legacy/releases/download/latest/go.zip
-          7z x go.zip
+          # MetaCubeX/go restores Win7 / macOS 10.15 support; stay on 1.26 since Go 1.27 drops macOS < 13
+          mkdir -p golang.org
+          curl -fL "https://github.com/MetaCubeX/go/releases/download/build/go1.26.$(go env GOHOSTOS)-$(go env GOHOSTARCH).tar.gz" | tar -xz -C golang.org
       - name: Install Protoc
         if: steps.cache-common.outputs.cache-hit != 'true'
         uses: arduino/setup-protoc@v3
@@ -312,3 +313,4 @@ jobs:
         if: github.event.inputs.publish == 'r'
         run: |
           ./ghr -delete -c ${{ github.sha }} -t "${{ github.token }}" -n "${{ github.event.inputs.tag }}" "${{ github.event.inputs.tag }}" deployment
+

@@ -6,6 +6,7 @@
 #include <QMimeData>
 #include <QPalette>
 
+#include "include/configs/generate.h"
 #include "include/database/GroupsRepo.h"
 #include "include/database/ProfilesRepo.h"
 
@@ -77,6 +78,7 @@ void ProfilesTableModel::evictOne() const {
     if (m_lruOrder.isEmpty()) return;
     int id = m_lruOrder.takeFirst();
     m_cache.remove(id);
+    m_addressCache.remove(id);
 }
 
 QVariant ProfilesTableModel::data(const QModelIndex &index, int role) const {
@@ -109,7 +111,11 @@ QVariant ProfilesTableModel::data(const QModelIndex &index, int role) const {
             }
             return type;
         }
-        case ColAddress: return profile->outbound ? profile->outbound->DisplayAddress() : QString();
+        case ColAddress: {
+            auto address = m_addressCache.constFind(profileId);
+            if (address == m_addressCache.constEnd()) address = m_addressCache.insert(profileId, Configs::DisplayEffectiveAddress(profile));
+            return address.value();
+        }
         case ColName: return profile->outbound ? profile->outbound->name : QString();
         case ColTestResult: return profile->DisplayTestResult();
         case ColTraffic: return profile->DisplayTraffic();
@@ -117,9 +123,10 @@ QVariant ProfilesTableModel::data(const QModelIndex &index, int role) const {
         }
     }
     if (role == Qt::ToolTipRole) {
-        if (index.column() == ColType && Configs::dataManager->settingsRepo->show_config_security
-            && profile->outbound && profile->outbound->GetSecurity().isDangerous()) {
-            return tr("This config's traffic is not properly protected.");
+        if (index.column() == ColType && Configs::dataManager->settingsRepo->show_config_security && profile->outbound) {
+            const auto security = profile->outbound->EffectiveSecurity();
+            if (security.compromised) return tr("Certificate checks are turned off by the \"Skip TLS certificate authentication\" setting.");
+            if (security.isDangerous()) return tr("This config's traffic is not properly protected.");
         }
         return {};
     }
@@ -159,6 +166,7 @@ void ProfilesTableModel::setProfileIds(const QList<int> &ids) {
     }
     m_cache.clear();
     m_lruOrder.clear();
+    m_addressCache.clear();
     m_filterKeys.clear();
     m_filterIndexBuilt = false;
     endResetModel();
@@ -171,6 +179,7 @@ namespace {
         key.country = profile->test_country;
         if (profile->outbound) {
             key.address = profile->outbound->server;
+            key.effectiveAddress = Configs::EffectiveEndpointHost(profile);
             key.name = profile->outbound->name;
             key.port = profile->outbound->server_port;
         }
@@ -206,6 +215,7 @@ void ProfilesTableModel::refreshTable(const QList<int> &ids, bool mayNeedReset) 
     if (needFullReset) {
         setProfileIds(ids);
     } else {
+        m_addressCache.clear();
         m_filterKeys.clear();
         m_filterIndexBuilt = false;
 
@@ -218,6 +228,7 @@ void ProfilesTableModel::refreshTable(const QList<int> &ids, bool mayNeedReset) 
 
 void ProfilesTableModel::refreshProfileId(int profileId) {
     if (!id2row.contains(profileId)) return;
+    m_addressCache.remove(profileId);
     // Keep the filter key in step before dataChanged makes the proxy re-test the row.
     if (m_filterIndexBuilt) {
         if (auto profile = Configs::dataManager->profilesRepo->GetProfile(profileId)) {
@@ -228,6 +239,14 @@ void ProfilesTableModel::refreshProfileId(int profileId) {
     QModelIndex top = index(r, 0);
     QModelIndex bottom = index(r, columnCount() - 1);
     emit dataChanged(top, bottom);
+}
+
+void ProfilesTableModel::invalidateAddresses() {
+    m_addressCache.clear();
+    m_filterKeys.clear();
+    m_filterIndexBuilt = false;
+    if (m_profileIds.isEmpty()) return;
+    emit dataChanged(index(0, ColAddress), index(static_cast<int>(m_profileIds.size()) - 1, ColAddress), {Qt::DisplayRole});
 }
 
 void ProfilesTableModel::emplaceProfiles(int row1, int row2) {

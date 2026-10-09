@@ -130,6 +130,30 @@ namespace Configs {
         }
     }
 
+    bool Database::transaction(const std::string& op, const std::function<bool()>& body) {
+        try {
+            db.exec("BEGIN IMMEDIATE");
+        } catch (std::exception& e) {
+            NotifyError(op, e);
+            return false;
+        }
+        try {
+            if (!body()) {
+                db.exec("ROLLBACK");
+                return false;
+            }
+            db.exec("COMMIT");
+            return true;
+        } catch (std::exception& e) {
+            try { db.exec("ROLLBACK"); } catch (...) {}
+            NotifyError(op, e);
+            return false;
+        } catch (...) {
+            try { db.exec("ROLLBACK"); } catch (...) {}
+            throw;
+        }
+    }
+
     void Database::execDeleteByIdInChunk(const std::string& table, const std::string& idColumn, const std::vector<int>& ids) {
         if (ids.empty()) return;
         std::string sql = "DELETE FROM " + table + " WHERE " + idColumn + " IN (";
@@ -190,10 +214,10 @@ namespace Configs {
     void Database::execBatchInsertProfilesChunk(const std::vector<ProfileInsertRow>& rows) {
         if (rows.empty()) return;
         const size_t n = rows.size();
-        std::string sql = "INSERT INTO profiles (id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country, ip_out, outbound_json, traffic_dl, traffic_up) VALUES ";
+        std::string sql = "INSERT INTO profiles (id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country, ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json) VALUES ";
         for (size_t i = 0; i < n; ++i) {
             if (i > 0) sql += ",";
-            sql += "(?,?,?,?,?,?,?,?,?,?,?,?,?)";
+            sql += "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         }
         try {
             SQLite::Statement stmt(db, sql);
@@ -212,6 +236,7 @@ namespace Configs {
                 stmt.bind(idx++, r.outbound_json);
                 stmt.bind(idx++, static_cast<int64_t>(r.traffic_dl));
                 stmt.bind(idx++, static_cast<int64_t>(r.traffic_up));
+                stmt.bind(idx++, r.endpoint_json);
             }
             stmt.exec();
             maybeCheckpoint(static_cast<int>(rows.size()));
@@ -223,10 +248,10 @@ namespace Configs {
     void Database::execBatchReplaceProfilesChunk(const std::vector<ProfileInsertRow>& rows) {
         if (rows.empty()) return;
         const size_t n = rows.size();
-        std::string sql = "INSERT OR REPLACE INTO profiles (id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country, ip_out, outbound_json, traffic_dl, traffic_up) VALUES ";
+        std::string sql = "INSERT OR REPLACE INTO profiles (id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country, ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json) VALUES ";
         for (size_t i = 0; i < n; ++i) {
             if (i > 0) sql += ",";
-            sql += "(?,?,?,?,?,?,?,?,?,?,?,?,?)";
+            sql += "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         }
         try {
             SQLite::Statement stmt(db, sql);
@@ -245,6 +270,7 @@ namespace Configs {
                 stmt.bind(idx++, r.outbound_json);
                 stmt.bind(idx++, static_cast<int64_t>(r.traffic_dl));
                 stmt.bind(idx++, static_cast<int64_t>(r.traffic_up));
+                stmt.bind(idx++, r.endpoint_json);
             }
             stmt.exec();
             maybeCheckpoint(static_cast<int>(rows.size()));
@@ -271,6 +297,7 @@ namespace Configs {
         const std::vector<std::string> kRouteTables = {"route_rules", "route_profiles"};
         const std::vector<std::string> kSettingsTables = {"settings", "markers"};
         const std::vector<std::string> kOtpTables = {"otp_profiles"};
+        const std::vector<std::string> kIpListTables = {"ip_list_entries", "ip_scans", "ip_lists"};
 
         std::vector<std::string> tableColumns(SQLite::Database& d, const std::string& schema, const std::string& table) {
             std::vector<std::string> cols;
@@ -293,23 +320,58 @@ namespace Configs {
             return std::find(cols.begin(), cols.end(), column) != cols.end();
         }
 
-        void copyTable(SQLite::Database& d, const std::string& table) {
-            if (!tableExists(d, "main", table) || !tableExists(d, "bak", table)) return;
+        // Backup-only column names come from the file, so embedded quotes are doubled.
+        std::string quoteIdent(const std::string& name) {
+            std::string out = "\"";
+            for (const char ch : name) {
+                if (ch == '"') out += '"';
+                out += ch;
+            }
+            return out + "\"";
+        }
+
+        // A route_rules row holding a value in a column this schema lacks (another app's condition) is skipped whole:
+        // copied without it, the rule would match more. Returns the number of skipped rows.
+        int copyTable(SQLite::Database& d, const std::string& table) {
+            if (!tableExists(d, "main", table) || !tableExists(d, "bak", table)) return 0;
 
             const auto mainCols = tableColumns(d, "main", table);
             const auto bakColsVec = tableColumns(d, "bak", table);
             const std::set<std::string> bakCols(bakColsVec.begin(), bakColsVec.end());
+            const std::set<std::string> mainColSet(mainCols.begin(), mainCols.end());
+
+            std::string keepRow;
+            if (table == "route_rules") {
+                for (const auto& c : bakColsVec) {
+                    if (mainColSet.count(c) != 0) continue;
+                    if (!keepRow.empty()) keepRow += " AND ";
+                    keepRow += "(" + quoteIdent(c) + " IS NULL OR " + quoteIdent(c) + " IN ('', '[]', 0, '0'))";
+                }
+            }
+            const int skipped = keepRow.empty() ? 0
+                : d.execAndGet("SELECT COUNT(*) FROM bak." + table + " WHERE NOT (" + keepRow + ")").getInt();
 
             std::string colList;
+            std::string selectList;
             for (const auto& c : mainCols) {
                 if (bakCols.count(c) == 0) continue;
-                if (!colList.empty()) colList += ",";
-                colList += "\"" + c + "\"";
+                if (!colList.empty()) {
+                    colList += ",";
+                    selectList += ",";
+                }
+                colList += quoteIdent(c);
+                // RoutesRepo numbers each profile's rules 0..n-1; close the gaps the skipped rows leave.
+                if (skipped > 0 && c == "rule_order")
+                    selectList += "ROW_NUMBER() OVER (PARTITION BY \"route_profile_id\" ORDER BY \"rule_order\") - 1";
+                else
+                    selectList += quoteIdent(c);
             }
-            if (colList.empty()) return;
+            if (colList.empty()) return 0;
 
             d.exec("DELETE FROM main." + table);
-            d.exec("INSERT INTO main." + table + " (" + colList + ") SELECT " + colList + " FROM bak." + table);
+            d.exec("INSERT INTO main." + table + " (" + colList + ") SELECT " + selectList + " FROM bak." + table +
+                   (keepRow.empty() ? "" : " WHERE " + keepRow));
+            return skipped;
         }
     }
 
@@ -333,11 +395,12 @@ namespace Configs {
         if (!parts.routes) wipe(kRouteTables);
         if (!parts.settings) wipe(kSettingsTables);
         if (!parts.otp) wipe(kOtpTables);
+        if (!parts.ipLists) wipe(kIpListTables);
         try { dest.exec("VACUUM"); } catch (...) {}
     }
 
-    void Database::restoreSelective(const std::string& srcPath, const BackupParts& parts) {
-        if (!parts.anyDb()) return;
+    int Database::restoreSelective(const std::string& srcPath, const BackupParts& parts) {
+        if (!parts.anyDb()) return 0;
 
         {
             SQLite::Statement attach(db, "ATTACH DATABASE ? AS bak");
@@ -345,13 +408,14 @@ namespace Configs {
             attach.exec();
         }
 
+        int skippedRules = 0;
         try {
             // foreign_keys must be toggled outside a transaction to take effect.
             db.exec("PRAGMA foreign_keys = OFF");
             db.exec("BEGIN IMMEDIATE");
 
             if (parts.profiles) for (const auto& t : kProfileTables) copyTable(db, t);
-            if (parts.routes) for (const auto& t : kRouteTables) copyTable(db, t);
+            if (parts.routes) for (const auto& t : kRouteTables) skippedRules += copyTable(db, t);
             if (parts.settings) {
                 for (const auto& t : kSettingsTables) copyTable(db, t);
                 // Settings saved before the markers table existed have been through no migration yet.
@@ -359,6 +423,7 @@ namespace Configs {
                     db.exec("DELETE FROM main.markers");
             }
             if (parts.otp) for (const auto& t : kOtpTables) copyTable(db, t);
+            if (parts.ipLists) for (const auto& t : kIpListTables) copyTable(db, t);
 
             // Keep the ID counters ahead of restored data so newly created IDs never collide.
             if (parts.profiles || parts.routes) {
@@ -384,6 +449,19 @@ namespace Configs {
                     std::string(bakOtpIds ? ",(SELECT COALESCE(MAX(otp_profile_last_id),0) FROM bak.entity_ids)" : "") + ")");
             }
 
+            if (parts.ipLists) {
+                const bool bakListIds = columnExists(db, "bak", "entity_ids", "ip_list_last_id");
+                db.exec(
+                    "UPDATE entity_ids SET ip_list_last_id = MAX(ip_list_last_id,"
+                    "(SELECT COALESCE(MAX(id),0) FROM ip_lists)" +
+                    std::string(bakListIds ? ",(SELECT COALESCE(MAX(ip_list_last_id),0) FROM bak.entity_ids)" : "") + ")");
+                const bool bakScanIds = columnExists(db, "bak", "entity_ids", "ip_scan_last_id");
+                db.exec(
+                    "UPDATE entity_ids SET ip_scan_last_id = MAX(ip_scan_last_id,"
+                    "(SELECT COALESCE(MAX(id),0) FROM ip_scans)" +
+                    std::string(bakScanIds ? ",(SELECT COALESCE(MAX(ip_scan_last_id),0) FROM bak.entity_ids)" : "") + ")");
+            }
+
             db.exec("COMMIT");
         } catch (...) {
             try { db.exec("ROLLBACK"); } catch (...) {}
@@ -395,5 +473,6 @@ namespace Configs {
         db.exec("PRAGMA foreign_keys = ON");
         db.exec("DETACH DATABASE bak");
         checkpointWal();
+        return skippedRules;
     }
 }

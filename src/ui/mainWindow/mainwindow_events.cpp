@@ -4,6 +4,7 @@
 #include <QCursor>
 #include <QLineEdit>
 #include <QMimeData>
+#include <QResizeEvent>
 #include <QTimer>
 
 #include "include/ui/widget/TrayOtpCodes.hpp"
@@ -102,11 +103,6 @@ void MainWindow::syncConnectionViewState() {
     Stats::connection_lister->SetInView(inView);
 }
 
-void MainWindow::resizeEvent(QResizeEvent *event) {
-    QMainWindow::resizeEvent(event);
-    scheduleProxyListRefresh();
-}
-
 void MainWindow::scheduleProxyListRefresh() {
     constexpr int proxyListRefreshDebounceMs = 200;
     if (m_proxyListRefreshDebounce) m_proxyListRefreshDebounce->start(proxyListRefreshDebounceMs);
@@ -153,12 +149,7 @@ void MainWindow::openTraySelector(bool routing) {
     TrayProfileSelector::Callbacks cb;
     cb.startProfile = [this](int id) { profile_start(id); };
     cb.stopProfile = [this]() { profile_stop(false, false, true); };
-    cb.chooseRoute = [this](int id) {
-        if (Configs::dataManager->settingsRepo->current_route_id == id) return;
-        Configs::dataManager->settingsRepo->current_route_id = id;
-        Configs::dataManager->settingsRepo->Save();
-        if (Configs::dataManager->settingsRepo->started_id >= 0) profile_start(Configs::dataManager->settingsRepo->started_id);
-    };
+    cb.chooseRoute = [this](int id) { choose_route(id); };
     cb.isRunning = [this]() { return running != nullptr; };
     cb.runningId = [this]() { return running ? running->id : -1; };
     cb.runningGid = [this]() { return running ? running->gid : -1; };
@@ -188,11 +179,24 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
 bool MainWindow::eventFilter(QObject *obj, QEvent *event) {
     const QEvent::Type type = event->type();
 
+    // Accepting the override keeps any window-level Esc shortcut from taking the key first.
+    if ((type == QEvent::ShortcutOverride || type == QEvent::KeyPress) && static_cast<QKeyEvent *>(event)->key() == Qt::Key_Escape
+        && obj->isWidgetType() && ui->logToolbar->isAncestorOf(static_cast<QWidget *>(obj))) {
+        if (type == QEvent::ShortcutOverride) event->accept();
+        else logFilterButton->setChecked(false);
+        return true;
+    }
+
     if (type == QEvent::Resize && obj == ui->toolButton_program) {
         const int h = ui->toolButton_program->height();
         if (h > 0 && ui->toolButton_startstop->height() != h) {
             ui->toolButton_startstop->setFixedSize(h, h);
         }
+    }
+    // The viewport, not the window: splitter moves and scrollbar toggles change its width too.
+    if (type == QEvent::Resize && obj == ui->profilesTableView->viewport()) {
+        const auto *resize = static_cast<QResizeEvent *>(event);
+        if (resize->size().width() != resize->oldSize().width()) refresh_proxy_list_column_size();
     }
     if (type == QEvent::MouseButtonPress) {
         auto mouseEvent = dynamic_cast<QMouseEvent *>(event);
