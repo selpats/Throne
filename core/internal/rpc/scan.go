@@ -21,7 +21,7 @@ func scanProbeRequest(in *gen.ScanProbeRequest) scan.ProbeRequest {
 	for _, entry := range spec.GetEntries() {
 		entries = append(entries, scan.Entry{CIDR: entry.GetCidr(), Port: entry.GetPort()})
 	}
-	icmp, tcp, http := in.GetIcmp(), in.GetTcp(), in.GetHttp()
+	icmp, tcp, http, dns := in.GetIcmp(), in.GetTcp(), in.GetHttp(), in.GetDns()
 	return scan.ProbeRequest{
 		Spec: scan.Spec{
 			Entries:          entries,
@@ -64,6 +64,13 @@ func scanProbeRequest(in *gen.ScanProbeRequest) scan.ProbeRequest {
 			MixedCaseSNI:          http.GetMixedCaseSni(),
 			Timeout:               milliseconds(http.GetTimeoutMs()),
 			FallbackPort:          http.GetFallbackPort(),
+		},
+		DNS: scan.DNSOptions{
+			Enabled:    dns.GetEnabled(),
+			Protocol:   dns.GetProtocol(),
+			ConfigJSON: dns.GetConfigJson(),
+			Level:      dns.GetLevel(),
+			Timeout:    milliseconds(dns.GetTimeoutMs()),
 		},
 		Concurrency:   int(in.GetConcurrency()),
 		SpawnInterval: milliseconds(in.GetSpawnIntervalMs()),
@@ -109,6 +116,11 @@ func (s *server) ScanProbe(ctx context.Context, in *gen.ScanProbeRequest) (*gen.
 			HttpStatus:   To(int32(r.HTTPStatus)),
 			ProbePort:    To(int32(r.ProbePort)),
 			LocalFailure: To(r.LocalFailure),
+			DnsMs:        To(r.DNSMs),
+			MaxQname:     To(r.MaxQName),
+			UploadMtu:    To(r.UploadMTU),
+			DownloadMtu:  To(r.DownloadMTU),
+			DnsStage:     To(r.DNSStage),
 		})
 	}
 	return out, nil
@@ -168,12 +180,12 @@ func (s *server) ScanURLTest(ctx context.Context, in *gen.ScanURLTestRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	defer env.close()
+	defer env.Close()
 
 	scanCtx := session.Context()
 	labels := in.GetTargetLabels()
-	labelOf := make(map[string]string, len(env.tags))
-	for idx, tag := range env.tags {
+	labelOf := make(map[string]string, len(env.Tags))
+	for idx, tag := range env.Tags {
 		labelOf[tag] = tag
 		if idx < len(labels) && labels[idx] != "" {
 			labelOf[tag] = labels[idx]
@@ -186,8 +198,14 @@ func (s *server) ScanURLTest(ctx context.Context, in *gen.ScanURLTestRequest) (*
 		}
 		session.RecordURL(labelOf[result.Tag], result.Duration, result.Error)
 	}
-	results := probe.BatchURLTestTo(scanCtx, env.box, env.tags, test.GetUrl(), int(test.GetMaxConcurrency()),
-		in.GetWarmLatency(), milliseconds(test.GetTestTimeoutMs()), publish)
+	var results []*probe.URLTestResult
+	if bodyBytes := in.GetBodyBytes(); bodyBytes > 0 {
+		results = probe.BatchDownloadTestTo(scanCtx, env.Box, env.Tags, test.GetUrl(), bodyBytes, int(test.GetMaxConcurrency()),
+			milliseconds(test.GetTestTimeoutMs()), publish)
+	} else {
+		results = probe.BatchURLTestTo(scanCtx, env.Box, env.Tags, test.GetUrl(), int(test.GetMaxConcurrency()),
+			in.GetWarmLatency(), milliseconds(test.GetTestTimeoutMs()), publish)
+	}
 	if scanCtx.Err() == nil && egressLost() {
 		return nil, scan.ErrEgressLost
 	}
@@ -204,9 +222,9 @@ func (s *server) ScanURLTest(ctx context.Context, in *gen.ScanURLTestRequest) (*
 				errStr = probe.ErrTestAborted.Error()
 			}
 		}
-		failed[env.tags[idx]] = errStr != ""
+		failed[env.Tags[idx]] = errStr != ""
 		res = append(res, &gen.URLTestResp{
-			OutboundTag: To(env.tags[idx]),
+			OutboundTag: To(env.Tags[idx]),
 			LatencyMs:   To(int32(data.Duration.Milliseconds())),
 			Error:       To(errStr),
 		})
@@ -219,7 +237,7 @@ func (s *server) ScanURLTest(ctx context.Context, in *gen.ScanURLTestRequest) (*
 		}
 	}
 	if len(pending) > 0 {
-		out.VpnStatus = collectVPNStatus(scanCtx, env.box, pending, 0)
+		out.VpnStatus = collectVPNStatus(scanCtx, env.Box, pending, 0)
 	}
 	return out, nil
 }

@@ -1,6 +1,7 @@
 // DO NOT INCLUDE THIS
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <QObject>
@@ -44,45 +45,22 @@ inline qint64 appStartEpoch = 0;
 
 class QWidget;
 inline QWidget *mainwindow;
-inline std::function<void(QString)> MW_show_log;
+
+// Thread-safe and never throws; without a sink the line only reaches the log file.
+void MW_show_log(const QString &line);
+
+void SetUserLogSink(std::function<void(const QString &)> sink);
 
 enum class MwMessage {
-    UpdateSettings,       // args: MwArg settings-change tokens
     RestartProgram,
     Raise,
-    UpdateShortcuts,
-    ProfileChanged,       // arg MwArg::RestartProxy when the saved profile is part of the running config
-    GroupsChanged,        // arg MwArg::RestartProxy when the edited group changed what a running profile dials
-    SubscriptionFinished, // arg MwArg::Quiet skips the import-count line
-    SubscriptionNewGroup,
-    // args: { group id, then the id of every profile it deleted or replaced in place }
-    SubscriptionGroupChanged,
-    CoreCrashed,
-    CoreStarted,          // args: { startedProfileId }
 };
 
-// String tokens carried in a MwMessage's argument list.
-namespace MwArg {
-    // UpdateSettings args.
-    inline const QString Route        = QStringLiteral("route");
-    inline const QString Vpn          = QStringLiteral("vpn");
-    inline const QString NeedRestart  = QStringLiteral("needRestart");
-    inline const QString ChoosePort   = QStringLiteral("choosePort");
-    inline const QString DisableTray  = QStringLiteral("disableTray");
-    inline const QString TrayIcon     = QStringLiteral("trayIcon");
-    inline const QString MaxLogLines  = QStringLiteral("maxLogLines");
-    inline const QString DisableAdmin = QStringLiteral("disableAdmin");
-    inline const QString ProfileListDisplay = QStringLiteral("profileListDisplay");
-    inline const QString KillSwitch   = QStringLiteral("killSwitch");
-    inline const QString LogFont      = QStringLiteral("logFont");
-    inline const QString RemoteApi    = QStringLiteral("remoteApi");
-    // ProfileChanged arg.
-    inline const QString RestartProxy = QStringLiteral("restartProxy");
-    // SubscriptionFinished arg.
-    inline const QString Quiet        = QStringLiteral("quiet");
-}
+// Thread-safe; dropped while no sink is installed.
+void MW_dialog_message(MwMessage cmd, const QStringList &args);
 
-inline std::function<void(MwMessage, QStringList)> MW_dialog_message;
+void SetDialogMessageSink(std::function<void(MwMessage, const QStringList &)> sink);
+
 // Set by MainWindow; marshals to the UI thread.
 inline std::function<void(QString)> MW_handle_deeplink;
 
@@ -93,11 +71,16 @@ inline std::function<void(QStringList)> MW_import_files;
 QString Deeplink_ExtractFromArgs(const QStringList &args);
 void Deeplink_Submit(const QString &url);
 void Deeplink_FlushPending();
+QString Deeplink_TakePending();
 
 // Paths may be given either as a plain path or as a file:// URL.
 QStringList LaunchFiles_ExtractFromArgs(const QStringList &args, const QDir &launchDir);
 void LaunchFiles_Submit(const QStringList &paths);
 void LaunchFiles_FlushPending();
+QStringList LaunchFiles_TakePending();
+
+// Drops the links and files to import, so a relaunch does not import them again.
+QStringList LaunchArgs_WithoutPayload(const QStringList &args);
 
 class QThread;
 inline QThread *DS_cores;
@@ -206,6 +189,14 @@ QString DisplayTime(long long time, int formatType = 0);
 
 QString ReadableSize(const qint64 &size);
 
+// At most maxGraphemes, so a leading flag emoji is never cut in half; longer names end in "…".
+QString ShortDisplayName(const QString &name, int maxGraphemes = 15);
+
+// steady_clock, so a wall-clock change can't reorder timestamps taken with it.
+inline qint64 MonotonicMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 inline bool InRange(unsigned x, unsigned low, unsigned high) {
     return (low <= x && x <= high);
 }
@@ -213,6 +204,15 @@ inline bool InRange(unsigned x, unsigned low, unsigned high) {
 inline bool IsValidPort(int port) {
     return InRange(port, 1, 65535);
 }
+
+// False under a plain QCoreApplication (headless) or before any app object exists; the helpers below then show nothing.
+bool IsGuiApp();
+
+// Dialogs swallowed because no QApplication exists; headless should keep this at 0.
+int HeadlessDialogCount();
+
+// Logs a HEADLESS-DIALOG line and counts it in HeadlessDialogCount().
+void LogHeadlessDialog(const QString &kind, const QString &title, const QString &text, const QString &defaultValue);
 
 QWidget *GetMessageBoxParent();
 
@@ -260,6 +260,7 @@ inline void connectOnce(EMITTER *emitter, SIGNAL signal, RECEIVER *receiver, Rec
 void setTimeout(const std::function<void()> &callback, QObject *obj, int timeout = 0);
 
 inline bool isDarkMode() {
+    if (!IsGuiApp()) return false;
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     return qApp->styleHints()->colorScheme() == Qt::ColorScheme::Dark;
 #endif

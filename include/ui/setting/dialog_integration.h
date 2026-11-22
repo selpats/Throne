@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QDialog>
+#include "include/database/SettingsValues.h"
+#include "include/engine/EditLocks.h"
 #include "include/global/Configs.hpp"
 #include "ui_dialog_integration.h"
 
@@ -9,6 +11,10 @@ namespace Ui {
     class DialogIntegration;
 }
 QT_END_NAMESPACE
+
+namespace Validation {
+    class Form;
+}
 
 class DialogIntegration : public QDialog {
     Q_OBJECT
@@ -26,6 +32,8 @@ public slots:
 private:
     void generateShortcutItems(const QList<QAction*>& actions);
 
+    void bindHotkeyValidation();
+
     void setupApiTab();
 
     void updateApiControls();
@@ -34,9 +42,21 @@ private:
 
     void copyForScripts();
 
-    static bool isValidAllowEntry(const QString &entry);
+    void setupCoreApisTab();
+
+    void bindCoreApiValidation();
+
+    struct HotkeyEdit {
+        QtExtKeySequenceEdit *edit = nullptr;
+        QString label;
+        bool global = false;
+    };
 
     QMap<QtExtKeySequenceEdit*, QString> seqEdit2ID;
+    QList<HotkeyEdit> hotkeyEdits;
+    Validation::Form *form = nullptr;
     QString savedApiKey;
+    Engine::EditLock settingsLock{Engine::EditTarget::Settings};
+    Configs::SettingsValues snapshot_;
     Ui::DialogIntegration *ui;
 };

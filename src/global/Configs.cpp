@@ -1,13 +1,12 @@
 #include "include/global/Configs.hpp"
 
-#include <QApplication>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QKeySequence>
 #include <QNetworkAccessManager>
 #include <QStandardPaths>
 #include <utility>
@@ -39,6 +38,13 @@ namespace Configs {
             defaultGroup->name = QObject::tr("Default");
             dataManager->groupsRepo->AddGroup(defaultGroup);
         }
+        // The window repairs this when it lists the groups; without one (headless) imports would target no group.
+        if (dataManager->groupsRepo->CurrentGroup() == nullptr) {
+            if (const auto order = dataManager->groupsRepo->GetGroupsTabOrder(); !order.isEmpty()) {
+                dataManager->settingsRepo->current_group = order.first();
+                dataManager->settingsRepo->Save();
+            }
+        }
         if (dataManager->routesRepo->GetAllRouteProfileIds().empty()) {
             auto defaultRoute = RouteProfile::GetDefaultChain();
             dataManager->routesRepo->AddRouteProfile(defaultRoute);
@@ -47,6 +53,16 @@ namespace Configs {
         if (!dataManager->markersRepo->IsMarked(Markers::DefaultIpLists)) {
             Scanner::DefaultIpLists::EnsureAll();
             dataManager->markersRepo->Mark(Markers::DefaultIpLists);
+            dataManager->markersRepo->Mark(Markers::DefaultResolverLists);
+            dataManager->markersRepo->Mark(Markers::WarpMasqueRanges);
+        } else {
+            if (!dataManager->markersRepo->IsMarked(Markers::DefaultResolverLists)) {
+                Scanner::DefaultIpLists::Ensure(Scanner::DefaultIpLists::kIranResolversName);
+                Scanner::DefaultIpLists::Ensure(Scanner::DefaultIpLists::kRussiaResolversName);
+                dataManager->markersRepo->Mark(Markers::DefaultResolverLists);
+            }
+            if (!dataManager->markersRepo->IsMarked(Markers::WarpMasqueRanges) && Scanner::DefaultIpLists::MigrateWarpMasqueRanges())
+                dataManager->markersRepo->Mark(Markers::WarpMasqueRanges);
         }
     }
 
@@ -56,7 +72,7 @@ namespace Configs {
         const auto wrapped = QStandardPaths::findExecutable("ThroneCore");
         if (!wrapped.isEmpty()) return wrapped;
 #endif
-        auto fn = QApplication::applicationDirPath() + "/ThroneCore";
+        auto fn = QCoreApplication::applicationDirPath() + "/ThroneCore";
 #ifdef Q_OS_WIN
         fn += ".exe";
 #endif
@@ -94,25 +110,75 @@ namespace Configs {
     bool IsAdmin(bool forceRenew) {
         if (isAdminCache >= 0 && !forceRenew) return isAdminCache;
 
-        bool admin = false;
 #ifdef Q_OS_WIN
-        admin = Windows_IsInAdmin();
-        Configs::dataManager->settingsRepo->windows_set_admin = admin;
-#else
+        // The core inherits an elevated Throne's token.
+        if (Windows_IsInAdmin()) {
+            isAdminCache = 1;
+            return true;
+        }
+#endif
         // Unknown until the core answers; caching that would pin "not elevated" for the session.
         if (API::defaultClient == nullptr || !API::defaultClient->IsConnected()) return false;
         bool ok;
-        const auto isPrivileged = API::defaultClient->IsPrivileged(&ok);
+        const auto info = API::defaultClient->Privileges(&ok);
         if (!ok) return false;
-        admin = isPrivileged;
+        SetKnownCapabilities(info);
+        isAdminCache = info.privileged;
+        return info.privileged;
+    }
+
+    std::optional<bool> KnownAdmin() {
+#ifdef Q_OS_WIN
+        if (Windows_IsInAdmin()) return true;
 #endif
-        isAdminCache = admin;
-        return admin;
+        if (isAdminCache >= 0) return isAdminCache != 0;
+        return std::nullopt;
+    }
+
+    void SetKnownAdmin(bool admin) {
+        isAdminCache = admin ? 1 : 0;
+    }
+
+    namespace {
+        std::optional<API::PrivilegeInfo> configsKnownCapabilities;
+    } // namespace
+
+    std::optional<API::PrivilegeInfo> KnownCapabilities() {
+        return configsKnownCapabilities;
+    }
+
+    void SetKnownCapabilities(const API::PrivilegeInfo &info) {
+        configsKnownCapabilities = info;
+    }
+
+    void RefreshStaleTunDevice(int timeoutMs) {
+#ifdef Q_OS_WIN
+        Q_UNUSED(timeoutMs);
+#else
+        // Only the device can appear later; a running core never gains CAP_NET_ADMIN.
+        const auto caps = KnownCapabilities();
+        if (!caps || caps->tunDevice != false) return;
+        if (API::defaultClient == nullptr || !API::defaultClient->IsConnected()) return;
+        bool ok = false;
+        const auto info = API::defaultClient->Privileges(&ok, timeoutMs);
+        if (!ok) return;
+        SetKnownAdmin(info.privileged);
+        SetKnownCapabilities(info);
+#endif
+    }
+
+    namespace {
+        QString basePathOverride;
+    } // namespace
+
+    void SetBasePath(const QString &path) {
+        basePathOverride = path;
     }
 
     QString GetBasePath() {
+        if (!basePathOverride.isEmpty()) return basePathOverride;
         if (Configs::dataManager->settingsRepo->flag_use_appdata) return QStandardPaths::writableLocation(
               QStandardPaths::AppConfigLocation);
-        return qApp->applicationDirPath();
+        return QCoreApplication::applicationDirPath();
     }
 } // namespace Configs

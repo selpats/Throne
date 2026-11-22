@@ -10,6 +10,8 @@
 #include <utility>
 #include <type_traits>
 
+#include <QStringList>
+
 #include "include/global/Utils.hpp"
 
 namespace Configs {
@@ -28,6 +30,7 @@ namespace Configs {
         long long traffic_dl = 0;
         long long traffic_up = 0;
         std::string endpoint_json = "{}";
+        std::string service_checks;
     };
     // icons is the icons/ folder, handled by the UI layer rather than the database.
     struct BackupParts {
@@ -68,6 +71,10 @@ namespace Configs {
     // Read-only, corrupt or not a database: the file itself is unusable and retrying cannot help.
     bool IsFatalDbError(const DbError& err);
 
+    // An existing database file (or its -wal/-shm) this user cannot read and write: Unix access() fails with EACCES/EPERM;
+    // Windows the read-only attribute or, with Qt >= 6.6, the NTFS ACL. A missing file is not denied.
+    bool DbFilesDenied(const QString& dbFile);
+
     // Logs (rate-limited per query) and shows one passive notice per query per window; never blocks the caller.
     void NotifyError(const std::string& query, const DbError& err);
 
@@ -87,7 +94,7 @@ namespace Configs {
         void maybeVacuum();
 
         void execDeleteByIdInChunk(const std::string& table, const std::string& idColumn, const std::vector<int>& ids);
-        void execBatchSettingsReplaceChunk(const std::vector<std::pair<std::string, std::string>>& keyValues);
+        bool execBatchSettingsReplaceChunk(const std::vector<std::pair<std::string, std::string>>& keyValues);
         void execBatchInsertIntPairsChunk(const std::string& table, const std::string& colA, const std::string& colB,
                                          const std::vector<int>& pairs);
         void execBatchInsertProfilesChunk(const std::vector<ProfileInsertRow>& rows);
@@ -108,7 +115,7 @@ namespace Configs {
 
         [[nodiscard]] const std::string& Path() const { return path_; }
 
-        // Transactions span the connection: hold this to write, or to read rows a writer may be replacing.
+        // Transactions span the connection: hold this to write, or to read rows a writer may be replacing. Take it after repo locks.
         std::recursive_mutex& WriteMutex() { return writeMutex_; }
 
     private:
@@ -164,14 +171,15 @@ namespace Configs {
             }
         }
 
-        void execBatchSettingsReplace0(const std::vector<std::pair<std::string, std::string>>& keyValues) {
+        bool execBatchSettingsReplace0(const std::vector<std::pair<std::string, std::string>>& keyValues) {
             const size_t chunkSize = BATCH_LIMIT_WRITE / 2;
             for (size_t off = 0; off < keyValues.size(); off += chunkSize) {
                 size_t end = std::min(off + chunkSize, keyValues.size());
                 std::vector<std::pair<std::string, std::string>> chunk(keyValues.begin() + static_cast<std::ptrdiff_t>(off),
                                                                        keyValues.begin() + static_cast<std::ptrdiff_t>(end));
-                execBatchSettingsReplaceChunk(chunk);
+                if (!execBatchSettingsReplaceChunk(chunk)) return false;
             }
+            return true;
         }
 
         void execBatchInsertIntPairs0(const std::string& table, const std::string& colA, const std::string& colB,
@@ -191,9 +199,9 @@ namespace Configs {
             }
         }
 
-        // 14 bind params per row.
+        // 15 bind params per row.
         void execBatchInsertProfiles0(const std::vector<ProfileInsertRow>& rows) {
-            const size_t chunkSize = BATCH_LIMIT_WRITE / 14;
+            const size_t chunkSize = BATCH_LIMIT_WRITE / 15;
             for (size_t off = 0; off < rows.size(); off += chunkSize) {
                 size_t end = std::min(off + chunkSize, rows.size());
                 std::vector<ProfileInsertRow> chunk(rows.begin() + static_cast<std::ptrdiff_t>(off),
@@ -203,7 +211,7 @@ namespace Configs {
         }
 
         void execBatchReplaceProfiles0(const std::vector<ProfileInsertRow>& rows) {
-            const size_t chunkSize = BATCH_LIMIT_WRITE / 14;
+            const size_t chunkSize = BATCH_LIMIT_WRITE / 15;
             for (size_t off = 0; off < rows.size(); off += chunkSize) {
                 size_t end = std::min(off + chunkSize, rows.size());
                 std::vector<ProfileInsertRow> chunk(rows.begin() + static_cast<std::ptrdiff_t>(off),
@@ -242,13 +250,16 @@ namespace Configs {
             }
         }
 
-        // BEGIN IMMEDIATE .. COMMIT; body returning false rolls back quietly, a throw rolls back and is reported as op.
+        // BEGIN IMMEDIATE .. COMMIT under WriteMutex(); body returning false rolls back quietly, a throw rolls back and is reported as op.
         bool transaction(const std::string& op, const std::function<bool()>& body);
 
         template<typename... Args>
         std::unique_ptr<SQLite::Statement> queryThrow(const std::string& sql, Args&&... args) {
             return query0(sql, std::forward<Args>(args)...);
         }
+
+        // For a write run on a statement from queryThrow: counts it toward the WAL checkpoint, as execThrow does.
+        void countWrites(int count) { maybeCheckpoint(count); }
 
         template<typename... Args>
         std::unique_ptr<SQLite::Statement> query(const std::string& sql, Args&&... args) {
@@ -269,11 +280,15 @@ namespace Configs {
             }
         }
 
-        void execBatchSettingsReplace(const std::vector<std::pair<std::string, std::string>>& keyValues) {
+        // Throws instead of swallowing, so a caller's explicit transaction aborts as one unit.
+        void execDeleteByIdInThrow(const std::string& table, const std::string& idColumn, const std::vector<int>& ids);
+
+        bool execBatchSettingsReplace(const std::vector<std::pair<std::string, std::string>>& keyValues) {
             try {
-                execBatchSettingsReplace0(keyValues);
+                return execBatchSettingsReplace0(keyValues);
             } catch (std::exception& e) {
                 NotifyError("execBatchSettingsReplace", e);
+                return false;
             }
         }
 
@@ -308,10 +323,12 @@ namespace Configs {
         void restoreFrom(const std::string& srcPath);
 
         // entity_ids is always retained so restored IDs stay consistent; caller must delete destPath first. Throws on failure.
-        void backupSelective(const std::string& destPath, const BackupParts& parts);
+        // excludedSettingKeys (DB key names) are left out of a settings backup.
+        void backupSelective(const std::string& destPath, const BackupParts& parts, const QStringList& excludedSettingKeys = {});
 
         // Only columns present in both schemas are copied, so cross-version backups still restore; a route rule with data
         // in a column this schema lacks is skipped instead. Returns the number of skipped route rules. Throws on failure.
-        int restoreSelective(const std::string& srcPath, const BackupParts& parts);
+        // preservedSettingKeys (DB key names) keep this database's values when settings are restored.
+        int restoreSelective(const std::string& srcPath, const BackupParts& parts, const QStringList& preservedSettingKeys = {});
     };
 }

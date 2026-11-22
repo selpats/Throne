@@ -33,7 +33,8 @@
      </property>
      <layout class="QGridLayout" name="main">
       <item row="3" column="1">
-       <widget class="QComboBox" name="landing_proxy"/>
+       <widget class="QComboBox" name="landing_proxy">
+       </widget>
       </item>
       <item row="1" column="1">
        <widget class="QComboBox" name="type">
@@ -66,7 +67,8 @@
       <item row="2" column="1">
        <layout class="QHBoxLayout" name="horizontalLayout">
         <item>
-         <widget class="QComboBox" name="front_proxy"/>
+         <widget class="QComboBox" name="front_proxy">
+         </widget>
         </item>
        </layout>
       </item>
@@ -87,12 +89,26 @@
       <item row="0" column="1">
        <widget class="QLineEdit" name="name"/>
       </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="route_l">
+        <property name="text">
+         <string>Routing Profile</string>
+        </property>
+       </widget>
+      </item>
       <item row="4" column="1">
+       <widget class="QComboBox" name="route">
+        <property name="toolTip">
+         <string>Routing profile this group's profiles use. Default: the Routing menu's choice.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="1">
        <layout class="QHBoxLayout" name="common_options_layout">
         <item>
          <widget class="QCheckBox" name="auto_clear_unavailable">
           <property name="text">
-           <string>Auto Clear Unavailable Profiles</string>
+           <string>Auto clear unavailable profiles</string>
           </property>
          </widget>
         </item>
@@ -152,6 +168,16 @@
         </property>
        </widget>
       </item>
+      <item row="2" column="1">
+       <widget class="QCheckBox" name="import_sub_route">
+        <property name="toolTip">
+         <string>Each update saves the subscription's Happ routing profile for this group.</string>
+        </property>
+        <property name="text">
+         <string>Use the subscription's routing profile</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
@@ -171,7 +197,7 @@
       <item>
        <widget class="QPushButton" name="copy_links_nkr">
         <property name="text">
-         <string>Copy profile share links (Deep Links)</string>
+         <string>Copy profile share links (deep links)</string>
         </property>
        </widget>
       </item>
@@ -197,10 +223,12 @@
  <tabstops>
   <tabstop>name</tabstop>
   <tabstop>type</tabstop>
+  <tabstop>route</tabstop>
   <tabstop>auto_clear_unavailable</tabstop>
   <tabstop>advanced</tabstop>
   <tabstop>url</tabstop>
   <tabstop>skip_auto_update</tabstop>
+  <tabstop>import_sub_route</tabstop>
   <tabstop>copy_links</tabstop>
   <tabstop>copy_links_nkr</tabstop>
  </tabstops>

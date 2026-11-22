@@ -4,7 +4,21 @@
 #include <QObject>
 #include <QSet>
 
+#include <variant>
+
+#include "include/global/Validation.hpp"
+
 namespace Configs {
+    struct RuleIssue {
+        Validation::Severity severity = Validation::Severity::Error;
+        QString attr;
+        QString message;
+        // The offending list item; empty when the message is about the attribute as a whole.
+        QString value;
+        // The other attribute of a cross-field problem.
+        QString related;
+    };
+
     enum inputType {trufalse, select, text};
 
     // -4 is reserved internally for dns hijack (see get_rule_json), so warp-bypass is -5.
@@ -96,14 +110,21 @@ namespace Configs {
         return ruleSet;
     }
 
+    struct RouteRuleAttribute;
+
     class RouteRule {
     public:
         RouteRule() = default;
 
         RouteRule(const RouteRule& other);
+        RouteRule& operator=(const RouteRule& other) = default;
 
         QString name = "";
         int type = custom;
+        // Kept in the profile but left out of the generated config.
+        bool disabled = false;
+        // Came from the profile's remote source, so the next update replaces it. Local state, never shared.
+        bool remote = false;
         QString ip_version;
         QString network;
         QString protocol;
@@ -137,6 +158,10 @@ namespace Configs {
 
         QString override_address;
         QString override_port;
+        // since sing-box 1.12.0
+        bool tls_fragment = false;
+        QString tls_fragment_fallback_delay;
+        bool tls_record_fragment = false;
         // since sing-box 1.14.0
         QString tls_spoof;
         QString tls_spoof_method;
@@ -153,17 +178,66 @@ namespace Configs {
 
         [[nodiscard]] QJsonObject get_rule_json(bool forView = false, const QString& outboundTag = "");
         [[nodiscard]] QJsonObject to_share_json();
+        // Every attribute, in get_attributes() order, whatever the OS.
+        static const QList<RouteRuleAttribute>& attribute_table();
         static QStringList get_attributes();
         static QStringList tab_attributes();
-        [[nodiscard]] static bool is_attribute_at_default(RouteRule& rule, const QString& attr);
+        [[nodiscard]] static bool is_attribute_at_default(const RouteRule& rule, const QString& attr);
         void clear_attribute_value(const QString& attr);
         void ensure_ui_visible_attribute_tabs_seeded();
         static inputType get_input_type(const QString& fieldName);
         static QStringList get_values_for_field(const QString& fieldName);
-        QStringList get_current_value_string(const QString& fieldName);
+        [[nodiscard]] QStringList get_current_value_string(const QString& fieldName) const;
         [[nodiscard]] QString get_current_value_bool(const QString& fieldName) const;
         void set_field_value(const QString& fieldName, const QStringList& value);
         [[nodiscard]] bool isEmpty();
         bool canEditAttr(const QString &attr);
+
+        [[nodiscard]] static bool is_list_attribute(const QString& attr);
+        [[nodiscard]] static bool is_match_attribute(const QString& attr);
+        // The actions get_rule_json emits attr for; empty when it applies to every action.
+        [[nodiscard]] static QStringList action_scope(const QString& attr);
+        // The action get_rule_json emits: a route rule to block or dns_out is a reject or hijack-dns rule.
+        [[nodiscard]] QString effective_action() const;
+        [[nodiscard]] bool has_match_conditions() const;
+        // One list item or scalar value of attr, on its own; the outbound and cross-field rules are validate()'s.
+        [[nodiscard]] static RuleIssue check_value(const QString& attr, const QString& value);
+        // Every problem the core would refuse at start, or that leaves the rule not doing what it says.
+        [[nodiscard]] QList<RuleIssue> validate() const;
+        // The (attr, related, severity) shapes validate() reports cross-field problems in.
+        [[nodiscard]] static QList<RuleIssue> cross_checks();
+    };
+
+    // action and outbound have no member: their values are read and written by hand.
+    struct RouteRuleAttribute {
+        enum Flag { Match = 1, NoTab = 2, NotOnDarwin = 4 };
+        // How get_rule_json writes a set value; Plain writes a flag as true, text trimmed and a list's non-blank items.
+        enum class Json { Plain, Number, PositiveNumber, Numbers, RuleSets, ByHand };
+
+        QString name;
+        std::variant<std::monostate, QString RouteRule::*, QStringList RouteRule::*, bool RouteRule::*> member;
+        inputType input = text;
+        int flags = 0;
+        QStringList scope;
+        // Holds text, a JSON array or 0/1, by the member's type; null when not persisted.
+        const char* column = nullptr;
+        Json json = Json::Plain;
+        // get_rule_json writes it only alongside this key.
+        QString needs;
+        // When a text value is at its default; isEmpty() when null.
+        bool (*unset)(const QString& value) = nullptr;
+        QStringList (*values)() = nullptr;
+        QString (*check)(const QString& value, Validation::Severity* severity) = nullptr;
+
+        template<typename T>
+        [[nodiscard]] T* field(RouteRule& rule) const {
+            const auto ptr = std::get_if<T RouteRule::*>(&member);
+            return ptr != nullptr ? &(rule.*(*ptr)) : nullptr;
+        }
+        template<typename T>
+        [[nodiscard]] const T* field(const RouteRule& rule) const {
+            const auto ptr = std::get_if<T RouteRule::*>(&member);
+            return ptr != nullptr ? &(rule.*(*ptr)) : nullptr;
+        }
     };
 } // namespace Configs

@@ -9,9 +9,10 @@
 
 #include "include/configs/sub/GroupUpdater.hpp"
 #include "include/database/GroupsRepo.h"
+#include "include/engine/services/GroupService.h"
 #include "include/ui/group/dialog_edit_group.h"
 #include "include/ui/mainWindow/MainWindowInternal.h"
-#include "include/ui/mainWindow/TestRunner.h"
+#include "include/engine/tests/TestRunner.h"
 #include "include/ui/stats/dialog_endpoint_details.h"
 #include "include/ui/utils/ProfilesTableFilterHeader.h"
 #include "include/global/Utils.hpp"
@@ -170,86 +171,26 @@ void MainWindow::on_tabWidget_customContextMenuRequested(const QPoint &p) {
 
 void MainWindow::show_group_tab_menu(const QPoint &p) {
     const int clickedIndex = ui->tabWidget->tabBar()->tabAt(p);
+    const QPoint globalPos = ui->tabWidget->tabBar()->mapToGlobal(p);
     if (clickedIndex == -1) {
         QMenu menu(this);
-        connect(menu.addAction(tr("Add new Group")), &QAction::triggered, this, [=,this]{
-            auto ent = Configs::dataManager->groupsRepo->NewGroup();
-            auto dialog = new DialogEditGroup(ent, this);
-            const int ret = dialog->exec();
-            dialog->deleteLater();
-
-            if (ret == QDialog::Accepted) {
-                Configs::dataManager->groupsRepo->AddGroup(ent);
-                MW_dialog_message(MwMessage::GroupsChanged, {});
-            }
-        });
-
-        menu.exec(ui->tabWidget->tabBar()->mapToGlobal(p));
+        menu.addAction(ui->actionAdd_New_Group);
+        menu.addAction(ui->menu_manage_groups);
+        menu.exec(globalPos);
         return;
     }
 
+    // Every Groups menu action works on the current group, so the clicked tab becomes current first.
     ui->tabWidget->setCurrentIndex(clickedIndex);
-    QMenu menu(this);
+    ui->menuTesting->exec(globalPos);
+}
 
-    const auto clickedGroup = Configs::dataManager->groupsRepo->GetGroup(Configs::dataManager->groupsRepo->GetGroupsTabOrder()[clickedIndex]);
-
-    connect(menu.addAction(tr("Add new Group")), &QAction::triggered, this, [=,this]{
-        auto ent = Configs::dataManager->groupsRepo->NewGroup();
-        auto dialog = new DialogEditGroup(ent, this);
-        const int ret = dialog->exec();
-        dialog->deleteLater();
-
-        if (ret == QDialog::Accepted) {
-            Configs::dataManager->groupsRepo->AddGroup(ent);
-            MW_dialog_message(MwMessage::GroupsChanged, {});
-        }
-    });
-    connect(menu.addAction(tr("Edit selected Group")), &QAction::triggered, this, [=,this]{
-        const auto id = Configs::dataManager->groupsRepo->GetGroupsTabOrder()[clickedIndex];
-        auto ent = Configs::dataManager->groupsRepo->GetGroup(id);
-        auto dialog = new DialogEditGroup(ent, this);
-        connect(dialog, &QDialog::finished, this, [=,this] {
-            if (dialog->result() == QDialog::Accepted) {
-                Configs::dataManager->groupsRepo->Save(ent);
-                MW_dialog_message(MwMessage::GroupsChanged, dialog->RestartNeeded() ? QStringList{MwArg::RestartProxy} : QStringList{});
-            }
-            dialog->deleteLater();
-        });
-        dialog->show();
-    });
-    if (Configs::dataManager->groupsRepo->GetAllGroupIds().size() > 1) {
-        connect(menu.addAction(tr("Delete selected Group")), &QAction::triggered, this, [=,this] {
-            const auto id = Configs::dataManager->groupsRepo->GetGroupsTabOrder()[clickedIndex];
-            if (QMessageBox::question(this, tr("Confirmation"), tr("Remove %1?").arg(Configs::dataManager->groupsRepo->GetGroup(id)->name)) ==
-                QMessageBox::StandardButton::Yes) {
-                if (running != nullptr) {
-                    if (running->gid == id) profile_stop(false, true, false);
-                }
-                Configs::dataManager->groupsRepo->DeleteGroup(id);
-                MW_dialog_message(MwMessage::GroupsChanged, {});
-            }
-        });
+void MainWindow::delete_group(int gid, const QString &title) {
+    // Checked before the stop, so a refused delete leaves the running profile alone.
+    if (const auto refusal = Engine::GroupService::CheckDelete(gid)) {
+        MessageBoxWarning(title, GroupDeleteRefusalText(*refusal));
+        return;
     }
-    if (clickedGroup != nullptr && !clickedGroup->url.isEmpty()) {
-        connect(menu.addAction(tr("Update subscription")), &QAction::triggered, this, [=,this]{
-            const auto id = Configs::dataManager->groupsRepo->GetGroupsTabOrder()[clickedIndex];
-            auto group = Configs::dataManager->groupsRepo->GetGroup(id);
-            if (group->url.isEmpty()) return;
-            if (mw_sub_updating) return;
-            mw_sub_updating = true;
-            Subscription::updater()->RefreshGroup(group->id, [&] { mw_sub_updating = false; }, true);
-        });
-    }
-    if (clickedGroup != nullptr) {
-        connect(menu.addAction(tr("Url Test selected Group")), &QAction::triggered, this, [=,this]{
-            testRunner->runUrlTests(clickedGroup->Profiles());
-        });
-        connect(menu.addAction(tr("Speed Test selected Group")), &QAction::triggered, this, [=,this]{
-            testRunner->runSpeedTests(clickedGroup->Profiles());
-        });
-        // Clean up acts on the current group; setCurrentIndex above already switched to the clicked one.
-        menu.addSeparator();
-        menu.addMenu(ui->menu_clean_up);
-    }
-    menu.exec(ui->tabWidget->tabBar()->mapToGlobal(p));
+    if (const auto running = runningSnapshot(); running != nullptr && running->gid == gid) profile_stop(false, true, false);
+    if (const auto refusal = Engine::GroupService::Delete(gid)) MessageBoxWarning(title, GroupDeleteRefusalText(*refusal));
 }

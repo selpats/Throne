@@ -1,15 +1,23 @@
 #include "include/ui/stats/RuntimeStatsWidget.h"
 
-#include "include/ui/mainwindow.h"
 #include "include/ui/stats/dialog_endpoint_details.h"
 #include "include/api/RPC.h"
+#include "include/engine/EngineHost.h"
+#include "include/engine/connection/ConnectionManager.h"
+#include "include/engine/supervisor/CoreSupervisor.h"
+#include "include/engine/tests/TestRunner.h"
+#include "include/engine/vpn/VpnEndpoints.h"
 #include "include/configs/sub/GroupUpdater.hpp"
 #include "include/stats/traffic/TrafficLooper.hpp"
 #include "include/database/DatabaseManager.h"
+#include "include/database/ProfilesRepo.h"
 #include "include/database/SettingsRepo.h"
 #include "include/global/Utils.hpp"
-#include "include/global/HTTPRequestHelper.hpp"
-#include "include/global/CountryHelper.hpp"
+#include "include/global/ExitLookup.hpp"
+#include "include/ui/setting/ThemeManager.hpp"
+#include "include/ui/utils/ServiceCheckHtml.h"
+#include "include/ui/utils/ServiceIcons.h"
+#include "include/ui/widget/LiveChart.h"
 
 #include <QBrush>
 #include <QColor>
@@ -19,8 +27,6 @@
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QItemSelectionModel>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QPointer>
 #include <QStringList>
 #include <QPushButton>
@@ -28,10 +34,59 @@
 #include <QTimer>
 
 #include <algorithm>
+#include <limits>
+
+#ifdef Q_OS_WIN
+#include "include/sys/windows/guihelper.h"
+#else
+#include <unistd.h>
+#endif
 
 namespace {
     const QColor kRuntimeThroneColor = Stats::kStatsAccentColor;
     const QColor kRuntimeCoreColor = Stats::kStatsHealthyColor;
+
+    QString runtimeProcessName(const QColor &color, const QString &name, const QString &privilege) {
+        const QString text = privilege.isEmpty() ? name : QStringLiteral("%1 (%2)").arg(name, privilege);
+        return QStringLiteral("<span style=\"color:%1\">●</span> %2").arg(color.name(), text.toHtmlEscaped());
+    }
+
+    QString runtimeThronePrivilege() {
+#ifdef Q_OS_WIN
+        return Windows_IsInAdmin() ? RuntimeStatsWidget::tr("Admin") : QString();
+#else
+        return ::geteuid() == 0 ? QStringLiteral("root") : QString();
+#endif
+    }
+
+    QString runtimeCorePrivilege() {
+        const auto report = Configs::KnownCapabilities();
+        if (!report || !report->privileged) return {};
+#ifdef Q_OS_WIN
+        return RuntimeStatsWidget::tr("Admin");
+#elif defined(Q_OS_MACOS)
+        return QStringLiteral("root");
+#else
+        // A Linux core can hold the Tun capabilities as the user; only a root one may run the kill switch.
+        return report->killSwitch.value_or(true) ? QStringLiteral("root") : RuntimeStatsWidget::tr("capabilities");
+#endif
+    }
+
+    QString runningConfigName() {
+        auto *engine = Engine::host();
+        const auto running = engine != nullptr ? engine->connection()->runningSnapshot() : nullptr;
+        if (running == nullptr || running->outbound == nullptr) return {};
+        return running->outbound->DisplayTypeAndName();
+    }
+
+    std::shared_ptr<Configs::Profile> runningProfile() {
+        auto *engine = Engine::host();
+        const auto running = engine != nullptr ? engine->connection()->runningSnapshot() : nullptr;
+        if (running == nullptr) return nullptr;
+        // The repo's copy is the one a finished service check writes to.
+        const auto stored = Configs::dataManager->profilesRepo->GetProfile(running->id);
+        return stored != nullptr ? stored : running;
+    }
 
     QString formatCpu(const Sys::ProcessMetrics::Sample& s) {
         return s.ok ? QString::number(s.cpuPercent, 'f', 1) + QStringLiteral("%") : QStringLiteral("—");
@@ -39,6 +94,13 @@ namespace {
 
     QString formatRam(const Sys::ProcessMetrics::Sample& s) {
         return s.ok ? ReadableSize(s.rssBytes) : QStringLiteral("—");
+    }
+
+    // The provider the exit lookup asks, or empty while the lookup is off.
+    QString runtimeExitLookupProvider() {
+        const auto* settings = Configs::dataManager->settingsRepo.get();
+        if (!settings->exit_country_lookup) return {};
+        return settings->exit_lookup_provider.isEmpty() ? Configs_network::ExitLookupAutoId : settings->exit_lookup_provider;
     }
 }
 
@@ -52,16 +114,37 @@ RuntimeStatsWidget::RuntimeStatsWidget(QWidget* parent) : QWidget(parent), ui(ne
     ui->formRunning->setColumnStretch(1, 1);
     ui->formRunning->setColumnStretch(3, 1);
 
-    ui->cpuChart->setColors(kRuntimeThroneColor, kRuntimeCoreColor);
-    ui->ramChart->setColors(kRuntimeThroneColor, kRuntimeCoreColor);
-    ui->cpuChart->setFormatter([](double v) { return QString::number(v, 'f', 0) + QStringLiteral("%"); });
-    ui->ramChart->setFormatter([](double v) { return ReadableSize(static_cast<qint64>(v)); });
-    ui->cpuChart->setCaption(tr("CPU"));
-    ui->ramChart->setCaption(tr("RAM"));
-    ui->labelThroneName->setText(QStringLiteral("<span style=\"color:%1\">●</span> %2")
-                                     .arg(kRuntimeThroneColor.name(), "Throne"));
-    ui->labelCoreName->setText(QStringLiteral("<span style=\"color:%1\">●</span> %2")
-                                   .arg(kRuntimeCoreColor.name(), tr("Core")));
+    const QList<LiveChartRow> processRows{
+        LiveChartRow{QStringLiteral("throne"), QStringLiteral("Throne"), {}, kRuntimeThroneColor, 0, true},
+        LiveChartRow{QStringLiteral("core"), tr("Core"), {}, kRuntimeCoreColor, 0, false},
+    };
+    cpuChart_ = new LiveChart(LiveChartOptions::sparkline(tr("CPU"), LiveChartAxis::percent()), this);
+    ramChart_ = new LiveChart(LiveChartOptions::sparkline(tr("RAM"), LiveChartAxis::bytes()), this);
+    for (auto *chart : {cpuChart_, ramChart_}) {
+        chart->setMinimumHeight(100);
+        chart->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        chart->setRows(processRows);
+        ui->chartsRow->addWidget(chart);
+    }
+    ui->labelThroneName->setText(runtimeProcessName(kRuntimeThroneColor, QStringLiteral("Throne"), runtimeThronePrivilege()));
+    ui->labelCoreName->setText(runtimeProcessName(kRuntimeCoreColor, tr("Core"), {}));
+    // A lookup service's answer: as AutoText a tag in it would render as HTML.
+    ui->vOutIp->setTextFormat(Qt::PlainText);
+    ui->vCountry->setTextFormat(Qt::PlainText);
+    // Rich text built by ServiceCheckHtml::ipKind, which escapes everything it did not write itself.
+    ui->vServices->setTextFormat(Qt::RichText);
+    ui->vServices->setWordWrap(true);
+    serviceStrip_ = new ServiceIconStrip(this);
+    serviceStrip_->hide();
+    ui->servicesLayout->insertWidget(0, serviceStrip_);
+    ui->vServiceChecked->setTextFormat(Qt::PlainText);
+    connect(ui->btnServiceCheck, &QPushButton::clicked, this, [this] {
+        auto *engine = Engine::host();
+        if (engine == nullptr) return;
+        serviceChecking_->store(true);
+        engine->tests()->runCurrentServiceCheck([checking = serviceChecking_] { checking->store(false); });
+        refreshServices();
+    });
 
     ui->groupEndpoints->setVisible(false);
     auto* endpoints = ui->endpointsTable;
@@ -92,10 +175,8 @@ bool RuntimeStatsWidget::panelActive() const {
 
 void RuntimeStatsWidget::showEvent(QShowEvent *event) {
     QWidget::showEvent(event);
-    // A hidden gap turns the next CPU delta into an average over that gap, and splices the sparklines.
+    // A hidden gap would turn the next CPU delta into an average over that gap.
     metrics_.reset();
-    ui->cpuChart->clear();
-    ui->ramChart->clear();
     // The panel outlives a visit now, so the egress snapshot has to go stale with it; lastProbeSecs_ still rate-limits.
     egressSnapshotDone_ = false;
     timer_->start();
@@ -109,23 +190,65 @@ void RuntimeStatsWidget::hideEvent(QHideEvent *event) {
     if (details_) details_->close();
 }
 
+void RuntimeStatsWidget::refreshServices() {
+    auto *engine = Engine::host();
+    const auto running = runningProfile();
+    const auto items = running != nullptr ? ServiceCheckHtml::items(*running) : QList<ServiceIcons::Item>();
+    serviceStrip_->setItems(items);
+    serviceStrip_->setVisible(!items.isEmpty());
+    const QString failure = running != nullptr ? ServiceCheckHtml::failure(*running) : QString();
+    if (!failure.isEmpty()) {
+        ui->vServices->setText(QStringLiteral("<span style=\"color:%1; font-weight:600\">%2</span>")
+                                   .arg(themeManager()->tokens.danger.name(), QObject::tr("Failed").toHtmlEscaped()));
+    } else {
+        const QString kind = running != nullptr ? ServiceCheckHtml::ipKind(*running, true) : QString();
+        ui->vServices->setText(kind.isEmpty() && items.isEmpty() ? QStringLiteral("—") : kind);
+    }
+    ui->vServices->setToolTip(failure);
+
+    QString checked;
+    const qint64 checkedAt = running != nullptr ? running->ServiceCheckedAt() : 0;
+    if (serviceChecking_->load()) {
+        checked = tr("Checking…");
+    } else if (checkedAt > 0) {
+        const qint64 age = qMax<qint64>(0, QDateTime::currentSecsSinceEpoch() - checkedAt);
+        if (age < 60) checked = tr("Checked just now");
+        else checked = tr("Checked %1 ago").arg(age < 3600    ? QStringLiteral("%1m").arg(age / 60)
+                                                : age < 86400 ? QStringLiteral("%1h").arg(age / 3600)
+                                                              : QStringLiteral("%1d").arg(age / 86400));
+    }
+    ui->vServiceChecked->setText(checked);
+    ui->vServiceChecked->setVisible(!checked.isEmpty());
+
+    // The runner skips auto selectors, so the button would do nothing for one.
+    ui->btnServiceCheck->setEnabled(running != nullptr && running->type != QStringLiteral("autoselector") && engine != nullptr
+                                    && !engine->tests()->isRunning());
+}
+
 void RuntimeStatsWidget::refreshLive() {
     if (!panelActive()) return;
-    auto* mw = GetMainWindow();
+    auto *engine = Engine::host();
 
     const auto selfSample = metrics_.sample(QCoreApplication::applicationPid());
     ui->vThroneRam->setText(formatRam(selfSample));
     ui->vThroneCpu->setText(formatCpu(selfSample));
 
-    const qint64 corePid = mw ? mw->GetCorePid() : 0;
+    const qint64 corePid = engine != nullptr ? engine->supervisor()->corePid() : 0;
     const auto coreSample = corePid > 0 ? metrics_.sample(corePid) : Sys::ProcessMetrics::Sample{};
     ui->vCoreRam->setText(formatRam(coreSample));
     ui->vCoreCpu->setText(formatCpu(coreSample));
+    // The core's report comes in after each start; a restarted core can hold other rights.
+    ui->labelCoreName->setText(runtimeProcessName(kRuntimeCoreColor, tr("Core"), corePid > 0 ? runtimeCorePrivilege() : QString()));
 
-    ui->cpuChart->push(selfSample.ok ? selfSample.cpuPercent : 0.0,
-                       coreSample.ok ? coreSample.cpuPercent : 0.0);
-    ui->ramChart->push(selfSample.ok ? static_cast<double>(selfSample.rssBytes) : 0.0,
-                       coreSample.ok ? static_cast<double>(coreSample.rssBytes) : 0.0);
+    const auto cpu = [](const Sys::ProcessMetrics::Sample &s) {
+        return s.ok && s.cpuValid ? s.cpuPercent : std::numeric_limits<double>::quiet_NaN();
+    };
+    const auto ram = [](const Sys::ProcessMetrics::Sample &s) {
+        return s.ok ? static_cast<double>(s.rssBytes) : std::numeric_limits<double>::quiet_NaN();
+    };
+    const qint64 sampledAt = MonotonicMs();
+    cpuChart_->addPoint(sampledAt, true, {cpu(selfSample), cpu(coreSample)});
+    ramChart_->addPoint(sampledAt, true, {ram(selfSample), ram(coreSample)});
 
     const auto rate = [](double bps) { return ReadableSize(static_cast<qint64>(bps)) + QStringLiteral("/s"); };
     if (Stats::trafficLooper && Stats::trafficLooper->proxy) {
@@ -166,7 +289,16 @@ void RuntimeStatsWidget::refreshLive() {
     const qint64 up = appStartEpoch > 0 ? QDateTime::currentSecsSinceEpoch() - appStartEpoch : 0;
     ui->vUptime->setText(Stats::HumanizeDuration(up));
 
-    const QString cfgName = mw ? mw->GetRunningConfigName() : QString();
+    if (const QString lookup = runtimeExitLookupProvider(); lookup != egressLookup_) {
+        egressLookup_ = lookup;
+        egressSnapshotDone_ = false;
+        lastProbeSecs_ = 0;
+        const QString shown = lookup.isEmpty() ? tr("Off") : QStringLiteral("—");
+        ui->vOutIp->setText(shown);
+        ui->vCountry->setText(shown);
+    }
+
+    const QString cfgName = runningConfigName();
     const qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
     if (cfgName.isEmpty()) {
         ui->vCfgName->setText(tr("No active config"));
@@ -191,6 +323,8 @@ void RuntimeStatsWidget::refreshLive() {
             probeEgress();
         }
     }
+
+    refreshServices();
 
     if (!connBusy_.exchange(true)) {
         QPointer<RuntimeStatsWidget> self(this);
@@ -338,18 +472,21 @@ void RuntimeStatsWidget::openEndpointDetails(const QString& tag) {
 void RuntimeStatsWidget::probeEgress() {
     if (probing_.exchange(true)) return;
 
-    auto* mw = GetMainWindow();
-    if (mw == nullptr || mw->GetRunningConfigName().isEmpty()) {
+    if (runningConfigName().isEmpty()) {
         probing_.store(false);
         return;
     }
 
+    const QString provider = egressLookup_;
+    const QString config = lastProbedConfig_;
     ui->vPing->setText(QStringLiteral("…"));
-    if (ui->vOutIp->text() == QStringLiteral("—")) ui->vOutIp->setText(QStringLiteral("…"));
-    if (ui->vCountry->text() == QStringLiteral("—")) ui->vCountry->setText(QStringLiteral("…"));
+    for (auto* row : {ui->vOutIp, ui->vCountry}) {
+        if (provider.isEmpty()) row->setText(tr("Off"));
+        else if (row->text() == QStringLiteral("—")) row->setText(QStringLiteral("…"));
+    }
 
     QPointer<RuntimeStatsWidget> self(this);
-    runOnNewThread([self]() {
+    runOnNewThread([self, provider, config]() {
         QString pingText;
         {
             libcore::TestReq req;
@@ -359,7 +496,7 @@ void RuntimeStatsWidget::probeEgress() {
             const auto res = API::defaultClient->Test(&ok, req);
             if (ok && !res.results.empty()) {
                 const int lat = res.results[0].latency_ms.value();
-                const auto vpnText = lat > 0 ? QString() : MainWindow::liveVpnConnectOkText();
+                const auto vpnText = lat > 0 ? QString() : Stats::LiveVpnConnectOkText();
                 pingText = lat > 0 ? QStringLiteral("%1 ms").arg(lat)
                                    : (vpnText.isEmpty() ? RuntimeStatsWidget::tr("Unavailable") : vpnText);
             } else {
@@ -367,38 +504,31 @@ void RuntimeStatsWidget::probeEgress() {
             }
         }
 
-        QString ipText = RuntimeStatsWidget::tr("N/A");
-        QString countryText = RuntimeStatsWidget::tr("N/A");
-        bool egressOk = false;
-        const auto resp = NetworkRequestHelper::HttpGet(QStringLiteral("http://ip-api.com/json/"), true);
-        if (resp.error.isEmpty()) {
-            const QJsonDocument doc = QJsonDocument::fromJson(resp.data);
-            if (doc.isObject()) {
-                const QJsonObject obj = doc.object();
-                const QString ip = obj[QStringLiteral("query")].toString();
-                const QString countryName = obj[QStringLiteral("country")].toString();
-                const QString countryCode = obj[QStringLiteral("countryCode")].toString();
-                const QString city = obj[QStringLiteral("city")].toString();
-                if (!ip.isEmpty()) {
-                    ipText = ip;
-                    egressOk = true;
-                }
-                if (!countryName.isEmpty()) {
-                    countryText = CountryCodeToFlag(countryCode) + QStringLiteral(" ") + countryName;
-                    if (!city.isEmpty()) countryText += QStringLiteral(", ") + city;
-                }
-            }
+        // Off still counts as a finished snapshot, so the 30 s retry does not keep re-pinging.
+        QString ipText = RuntimeStatsWidget::tr("Off");
+        QString countryText = ipText;
+        bool egressOk = true;
+        if (!provider.isEmpty()) {
+            const auto info = Configs_network::LookupExit(provider);
+            ipText = info.ip.isEmpty() ? RuntimeStatsWidget::tr("N/A") : info.ip;
+            countryText = info.hasCountry() ? Configs_network::ExitLocationText(info) : RuntimeStatsWidget::tr("N/A");
+            egressOk = !info.ip.isEmpty() || info.hasCountry();
         }
 
-        runOnUiThread([self, pingText, ipText, countryText, egressOk]() {
+        runOnUiThread([self, provider, config, pingText, ipText, countryText, egressOk]() {
             if (!self) return;
+            self->probing_.store(false);
+            // The lookup setting or the config changed mid-probe, and refreshLive's own probe bailed on probing_.
+            if (provider != self->egressLookup_ || config != self->lastProbedConfig_) {
+                self->lastProbeSecs_ = 0;
+                return;
+            }
             if (!self->egressSnapshotDone_) {
                 self->ui->vPing->setText(pingText);
                 self->ui->vOutIp->setText(ipText);
                 self->ui->vCountry->setText(countryText);
                 if (egressOk) self->egressSnapshotDone_ = true;
             }
-            self->probing_.store(false);
         });
     });
 }

@@ -1,13 +1,98 @@
 #include "include/configs/common/utils.h"
 
 #include <algorithm>
+#include <QCoreApplication>
+#include <QHash>
 #include <QHostAddress>
+#include <QJsonArray>
 #include <QRegularExpression>
 
+#include "include/configs/common/xrayStreamSetting.h"
+#include "include/configs/ParseDiagnostics.h"
 #include "include/global/Configs.hpp"
+#include "include/global/Validation.hpp"
 
 namespace Configs
 {
+    bool AcceptOptional(const QString& field, const QString& message, const QString& value)
+    {
+        if (message.isEmpty()) return true;
+        ParseDiag::Warn(field, QCoreApplication::translate("Validation", "%1 The value was ignored.").arg(message), value);
+        return false;
+    }
+
+    void ReadQueryInt(const QUrlQuery& query, const QString& key, int& target, int min, int max)
+    {
+        if (!query.hasQueryItem(key)) return;
+        const auto text = query.queryItemValue(key).trimmed();
+        if (!AcceptOptional(key, Validation::Int(text, min, max), text)) return;
+        if (const auto value = Validation::ToInt(text)) target = static_cast<int>(*value);
+    }
+
+    QString LegacyComboValue(const QString& value, const QStringList& identifiers)
+    {
+        // Labels that case and space folding alone cannot map back.
+        static const QHash<QString, QString> translated = {
+            {QStringLiteral("нативный"), QStringLiteral("native")},
+            {QStringLiteral("bbr v2"), QStringLiteral("bbr2")},
+            {QStringLiteral("вариант bbr"), QStringLiteral("bbr_variant")},
+            {QStringLiteral("bbr变体"), QStringLiteral("bbr_variant")},
+            {QStringLiteral("标准bbr"), QStringLiteral("bbr_standard")},
+        };
+        const auto folded = value.trimmed().toLower();
+        for (const auto& candidate : {translated.value(folded, folded), QString(folded).replace(' ', '_'), QString(folded).remove(' ')}) {
+            if (identifiers.contains(candidate)) return candidate;
+        }
+        return value.trimmed();
+    }
+
+    QStringList JsonStringList(const QJsonValue& value, const QString& field)
+    {
+        if (value.isString()) return {value.toString()};
+        if (value.isNull() || value.isUndefined()) return {};
+        if (!value.isArray()) {
+            ParseDiag::Warn(field, QCoreApplication::translate("Validation", "Expected text or a list of text, so the value was ignored."));
+            return {};
+        }
+        QStringList items;
+        bool skipped = false;
+        for (const auto& item : value.toArray()) {
+            if (item.isString()) items << item.toString();
+            else skipped = true;
+        }
+        if (skipped) ParseDiag::Warn(field, QCoreApplication::translate("Validation", "List items that are not text were ignored."));
+        return items;
+    }
+
+    namespace Checks {
+        QString HeaderPairs(const QString& text)
+        {
+            const auto t = text.trimmed();
+            if (t.isEmpty()) return {};
+            if (t.contains('|')) return QCoreApplication::translate("Validation", "Must not contain \"|\", which separates headers in share links.");
+            const auto pairs = parseHeaderPairs(t);
+            bool ok = t.count('"') % 2 == 0 && !pairs.isEmpty();
+            for (qsizetype i = 0; ok && i < pairs.size(); i += 2) ok = !pairs[i].trimmed().isEmpty();
+            if (ok) return {};
+            return QCoreApplication::translate("Validation", "Write Name=value pairs separated by spaces, quoting values that contain spaces, for example User-Agent=\"Mozilla/5.0\" X-Token=abc.");
+        }
+
+        QString HostHeader(const QString& text, bool allowList)
+        {
+            const auto rule = [](const QString& item) { return Validation::HostPort(item, false); };
+            if (allowList) return Validation::EachItem(text, Validation::Split::Comma, rule);
+            return text.trimmed().isEmpty() ? QString() : rule(text);
+        }
+
+        QString ServerName(const QString& text)
+        {
+            const auto message = Validation::Host(text, Validation::Empty::Allowed);
+            if (message.isEmpty()) return {};
+            if (Validation::HostPort(text, true).isEmpty()) return QCoreApplication::translate("Validation", "Enter only the domain name, without a port.");
+            return message;
+        }
+    }
+
     void mergeUrlQuery(QUrlQuery& baseQuery, const QString& strQuery)
     {
         QUrlQuery query = QUrlQuery(strQuery);
@@ -17,12 +102,35 @@ namespace Configs
         }
     }
 
-    QString formDecodedQueryValue(const QUrlQuery& query, const QString& key)
+    namespace {
+        QStringList percentDecodings(const QByteArray& raw, bool spaceFirst, int depth)
+        {
+            auto spaced = raw;
+            spaced.replace('+', "%20");
+            const auto literal = QUrl::fromPercentEncoding(raw);
+            const auto form = QUrl::fromPercentEncoding(spaced);
+            // Form encoders (Go url.Values, quote_plus, URLEncoder) write a space as '+' and escape a real one; %20 beside a bare '+' means it is literal.
+            const bool hasEscapedPlus = raw.contains("%2B") || raw.contains("%2b");
+            const bool formFirst = raw.contains('+') && (hasEscapedPlus || (spaceFirst && !raw.contains("%20")));
+            QStringList result;
+            for (const auto& text : formFirst ? QStringList{form, literal} : QStringList{literal, form}) {
+                // Some generators encode the value twice; no JSON text starts with '%'.
+                if (const auto trimmed = text.trimmed(); depth < 2 && trimmed.startsWith('%')) result << percentDecodings(trimmed.toUtf8(), spaceFirst, depth + 1);
+                else result << text;
+            }
+            result.removeDuplicates();
+            return result;
+        }
+    }
+
+    QStringList queryValueDecodings(const QUrlQuery& query, const QString& key, bool spaceFirst)
     {
-        // urlencode()-style panels send '+' for a space, which QUrlQuery never decodes but keeps apart from %2B.
-        auto raw = query.queryItemValue(key, QUrl::FullyEncoded).toUtf8();
-        raw.replace('+', "%20");
-        return QUrl::fromPercentEncoding(raw);
+        return percentDecodings(query.queryItemValue(key, QUrl::FullyEncoded).toUtf8(), spaceFirst, 0);
+    }
+
+    QString queryLiteral(QString value)
+    {
+        return value.replace('%', QLatin1String("%25")).replace('+', QLatin1String("%2B"));
     }
 
     void mergeJsonObjects(QJsonObject& baseObject, const QJsonObject& obj)
@@ -58,31 +166,62 @@ namespace Configs
         return result;
     }
 
+    namespace {
+        // The TLS::ParseFromLink rule: a known security value, else an sni/peer unless security is explicitly off.
+        bool linkEnablesTls(const QUrlQuery& query) {
+            const auto security = query.queryItemValue("security").trimmed().toLower();
+            if (security == "tls" || security == "true" || security == "1" || security == "reality") return true;
+            if (security == "none" || security == "false" || security == "0") return false;
+            // ParseFromLink reads sni first and lets peer overwrite it.
+            const auto serverName = query.hasQueryItem("peer") ? query.queryItemValue("peer") : query.queryItemValue("sni");
+            return !serverName.isEmpty();
+        }
+    }
+
     // TODO add setting items and use them here
+    bool useXrayVless(const VlessTraits& traits) {
+        const auto& transport = traits.transport;
+        // Throne's Xray stream refuses any other network, which sing-box VLESS may still carry (http, quic), but it would drop the Xray-only values.
+        if (!transport.isEmpty() && !XrayNetworks.contains(transport)) return traits.xrayOnly;
+        // sing-box has no mKCP, so even a profile Xray refuses goes there to get Xray's reason.
+        if (transport == "kcp") return true;
+        // Xray refuses REALITY over ws and httpupgrade, which sing-box carries.
+        if (!traits.xrayOnly && traits.reality && !Checks::XrayRealityNetwork(QStringLiteral("reality"), transport).isEmpty()) return false;
+
+        const auto preference = dataManager->settingsRepo->xray_vless_preference;
+        return traits.xrayOnly
+               || preference == Xray::AllVLESS
+               || traits.rawHttpOverTls
+               || transport == "xhttp"
+               || transport == "xdrive"
+               || (traits.reality && preference == Xray::XhttpAndReality);
+    }
+
     bool useXrayVless(const QString& link) {
         auto url = QUrl(link);
         if (!url.isValid()) return false;
         auto query = QUrlQuery(url.query());
-        const auto transport = query.queryItemValue("type");
-        const auto security = query.queryItemValue("security");
+        const auto encryption = query.queryItemValue("encryption");
+        VlessTraits traits;
+        traits.transport = NormalizeXrayNetwork(query.queryItemValue("type"));
+        traits.reality = query.queryItemValue("security").trimmed().toLower() == "reality";
+        traits.xrayOnly = query.hasQueryItem("fm")
+                          || query.hasQueryItem("finalmask")
+                          // sing-box has no counterpart to verifyPeerCertByName
+                          || query.hasQueryItem("vcn")
+                          // sing-box rejects the CBC suites `cs` is used for; Xray accepts them with fp=unsafe
+                          || query.hasQueryItem("cs")
+                          // sing-box VLESS takes only "" and xtls-rprx-vision
+                          || query.queryItemValue("flow").trimmed().toLower() == "xtls-rprx-vision-udp443"
+                          || (!encryption.isEmpty() && encryption != "none")
+                          || !query.queryItemValue("extra").isEmpty()
+                          // sing-box REALITY cannot verify the ML-DSA-65 signature
+                          || (traits.reality && !query.queryItemValue("pqv").trimmed().isEmpty());
         // sing-box's http transport speaks the raw HTTP header only in plaintext; TLS (which a bare sni also enables) turns it into h2
-        const bool rawHttpOverTls = (transport.isEmpty() || transport == "tcp" || transport == "raw")
-                                    && query.queryItemValue("headerType") == "http"
-                                    && ((!security.isEmpty() && security != "none")
-                                        || !query.queryItemValue("sni").isEmpty()
-                                        || !query.queryItemValue("peer").isEmpty());
-
-        if (dataManager->settingsRepo->xray_vless_preference == Xray::AllVLESS
-            || rawHttpOverTls
-            || transport == "xhttp"
-            || query.hasQueryItem("fm")
-            || query.hasQueryItem("finalmask")
-            // sing-box has no counterpart to verifyPeerCertByName
-            || query.hasQueryItem("vcn")
-            || (security == "reality" && dataManager->settingsRepo->xray_vless_preference == Xray::XhttpAndReality)
-            || (query.queryItemValue("encryption") != "none" && query.queryItemValue("encryption") != "")
-            || query.queryItemValue("extra") != "") return true;
-        return false;
+        traits.rawHttpOverTls = (traits.transport.isEmpty() || traits.transport == "raw")
+                                && query.queryItemValue("headerType") == "http"
+                                && linkEnablesTls(query);
+        return useXrayVless(traits);
     }
 
     QString toAceHost(const QString& host)

@@ -1,16 +1,26 @@
 #pragma once
 
-#include <QWidget>
-#include <QListWidgetItem>
 #include <QDialog>
-#include <QEvent>
+#include <QList>
+#include <QPair>
+// dialog_manage_routes.h declares a QShortcut member and takes the class from here.
 #include <QShortcut>
 
-#include "3rdparty/qv2ray/v2/ui/QvAutoCompleteTextEdit.hpp"
-#include "ui_RouteItem.h"
-#include "include/database/entities/RouteProfile.h"
+#include <memory>
 
-class QListWidget;
+#include "include/database/entities/RouteProfile.h"
+#include "ui_RouteItem.h"
+
+class QCheckBox;
+class QCloseEvent;
+class QKeyEvent;
+class QLabel;
+class RouteDnsEditor;
+class RouteRulesPage;
+
+namespace Validation {
+    class Form;
+}
 
 class RouteItem : public QDialog {
     Q_OBJECT
@@ -20,44 +30,57 @@ public:
     ~RouteItem() override;
 
     std::shared_ptr<Configs::RouteProfile> chain;
+
+public slots:
+    void accept() override;
+
+    // Asks before throwing away changes.
+    void reject() override;
+
 signals:
     void settingsChanged(std::shared_ptr<Configs::RouteProfile> routingChain);
 
+protected:
+    void closeEvent(QCloseEvent *event) override;
+
+    void keyPressEvent(QKeyEvent *event) override;
+
 private:
+    struct EndpointRow {
+        int profileId = -1;
+        bool innerHops = false;
+        QWidget* widget = nullptr;
+        QLabel* subtitle = nullptr;
+        QCheckBox* toggle = nullptr;
+    };
+
     Ui::RouteItem *ui;
-    int currentIndex = -1;
 
-    int lastNum = 0;
+    Validation::Form* form = nullptr;
 
-    QStringList geo_items;
+    RouteRulesPage* rulesPage = nullptr;
 
-    QShortcut* deleteShortcut;
+    RouteDnsEditor* dnsEditor = nullptr;
 
-    QStringList outbounds;
+    QList<QPair<QString, int>> endpointCandidates;
 
-    std::map<int,int> outboundMap;
+    QList<EndpointRow> endpointRows;
 
-    AutoCompleteTextEdit* simpleDirect;
+    // The state Cancel compares against.
+    QString openedFingerprint;
 
-    AutoCompleteTextEdit* simpleBlock;
+    // Set once the user agreed to discard, so closing does not ask twice.
+    bool discardConfirmed = false;
 
-    AutoCompleteTextEdit* simpleProxy;
-
-    AutoCompleteTextEdit* simpleWarpBypass;
-
-    QListWidget* ruleAttrPlusList = nullptr;
-
-    QWidget* lastTabPage = nullptr;
+    void setupHeader();
 
     void setupRemoteSection();
 
     void fetchRemote(bool applyToChain);
 
-    QList<QPair<QString, int>> endpointCandidates;
-
     void setupEndpointsSection();
 
-    void refreshEndpointCandidates() const;
+    void refreshEndpointCandidates();
 
     void addEndpointRow(int profileId, bool innerHops);
 
@@ -67,52 +90,21 @@ private:
 
     [[nodiscard]] QList<int> listedInnerHopEndpointIDs() const;
 
-    // The listed endpoint profileId is an opened-up inner hop of, or -1.
-    [[nodiscard]] int innerHopOwner(int profileId) const;
-
     void setEndpointRowInnerHops(int profileId, bool innerHops);
 
     // One endpointPreferredBy rule per listed endpoint and opened-up inner hop, keeping existing rules where they sit.
     void syncEndpointRules();
 
-    [[nodiscard]] bool currentRuleIsEndpoint() const;
+    void refreshEndpointSubtitles();
 
-    void applyRuleEditLock();
+    void reloadRules();
 
-    void reloadRuleViewsFromChain();
+    void setDefaultOutbound(int outboundID);
 
-    void ensurePlusTabBuiltOnce();
+    [[nodiscard]] int defaultOutbound() const;
 
-    void removeAllAttributeTabsExceptPlus();
+    [[nodiscard]] QString fingerprint() const;
 
-    void syncPlusListCheckStatesFromRule();
-
-    void persistCurrentRuleAttrTabLabel();
-
-    void applyStoredRuleAttrTabSelection();
-
-    void syncRuleActionCombo();
-
-    void rebuildRuleAttributeTabs();
-
-    [[nodiscard]] QWidget* makeAttributeEditorPage(const QString& attr);
-
-    void updateRuleSection();
-
-    void updateRulePreview();
-
-    void updateRouteItemsView();
-
-    void applyAttributeVisibilityChange(const QString& attr, bool visible);
-
-protected:
-    bool eventFilter(QObject* watched, QEvent* event) override;
-
-private slots:
-    void accept() override;
-
-    void on_new_route_item_clicked();
-    void on_moveup_route_item_clicked();
-    void on_movedown_route_item_clicked();
-    void on_delete_route_item_clicked();
+    // True when nothing changed or the user chose to discard.
+    bool confirmDiscard();
 };

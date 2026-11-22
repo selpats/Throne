@@ -1,29 +1,69 @@
 #include "include/ui/setting/dialog_integration.h"
 
-#include <include/global/GuiUtils.hpp>
+#include <include/ui/utils/GuiUtils.hpp>
 
 #include "include/api/remote/Server.hpp"
+#include "include/engine/services/SettingsService.h"
 #include "include/global/LocalNetwork.hpp"
-#include "include/ui/mainwindow_interface.h"
+#include "include/global/Validation.hpp"
+#include "include/ui/mainwindow.h"
+#include "include/ui/utils/ValidationForm.h"
 #include <QAction>
 #include <QClipboard>
 #include <QHostAddress>
+#include <QIntValidator>
 #include <QLabel>
 #include <QMessageBox>
-#include <QRegularExpression>
 #include <QScreen>
+#include <QUuid>
+
+#include <functional>
+#include <optional>
+
+namespace {
+    // Mirrors GlobalHotkeys::setActions, which registers only the first chord and refuses keys that would swallow typing.
+    QString integrationGlobalHotkeyError(const QKeySequence &key) {
+        if (key.isEmpty()) return {};
+        if (key.count() > 1) return DialogIntegration::tr("Global hotkeys can only be a single key combination.");
+        const QKeyCombination chord = key[0];
+        if (!(chord.keyboardModifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) && chord.key() < Qt::Key_F1)
+            return DialogIntegration::tr("\"%1\" needs Ctrl, Alt or Meta, otherwise it would block typing in other applications.")
+                .arg(key.toString(QKeySequence::NativeText));
+        return {};
+    }
+
+    // Accepts exactly what RemoteApi::ConfigFromSettings keeps, netmask and leading-zero forms included.
+    QString integrationAllowEntryError(const QString &entry) {
+        const auto host = entry.section(QLatin1Char('/'), 0, 0);
+        if (host.contains(QLatin1Char(':')) || host.count(QLatin1Char('.')) == 3) {
+            const auto subnet = entry.contains(QLatin1Char('/')) ? entry : entry + (host.contains(QLatin1Char(':')) ? QStringLiteral("/128") : QStringLiteral("/32"));
+            if (QHostAddress::parseSubnet(subnet).second >= 0) return {};
+        }
+        if (auto message = Validation::Cidr(entry, Validation::Family::Any, true); !message.isEmpty()) return message;
+        return DialogIntegration::tr("Enter an IP address or a range such as 192.168.1.0/24 or fd00::/8.");
+    }
+
+    QString integrationFieldLabel(QFormLayout *layout, QWidget *field) {
+        const auto *label = qobject_cast<QLabel *>(layout->labelForField(field));
+        return label != nullptr ? label->text() : QString();
+    }
+}
 
 DialogIntegration::DialogIntegration(QWidget *parent, const QList<QAction*>& actions) : QDialog(parent), ui(new Ui::DialogIntegration) {
+    snapshot_ = *Configs::dataManager->settingsRepo;
     ui->setupUi(this);
-    ui->show_mainwindow->setKeySequence(Configs::dataManager->settingsRepo->hotkey_mainwindow);
-    ui->show_groups->setKeySequence(Configs::dataManager->settingsRepo->hotkey_group);
-    ui->show_routes->setKeySequence(Configs::dataManager->settingsRepo->hotkey_route);
-    ui->system_proxy->setKeySequence(Configs::dataManager->settingsRepo->hotkey_system_proxy_menu);
-    ui->toggle_proxy->setKeySequence(Configs::dataManager->settingsRepo->hotkey_toggle_system_proxy);
-    ui->toggle_connection->setKeySequence(Configs::dataManager->settingsRepo->hotkey_toggle_connection);
-    ui->toggle_tun->setKeySequence(Configs::dataManager->settingsRepo->hotkey_toggle_tun);
+    form = new Validation::Form(this);
+    form->attachStatus(ui->buttonBox);
+    ui->show_mainwindow->setKeySequence(snapshot_.hotkey_mainwindow);
+    ui->show_groups->setKeySequence(snapshot_.hotkey_group);
+    ui->show_routes->setKeySequence(snapshot_.hotkey_route);
+    ui->system_proxy->setKeySequence(snapshot_.hotkey_system_proxy_menu);
+    ui->toggle_proxy->setKeySequence(snapshot_.hotkey_toggle_system_proxy);
+    ui->toggle_connection->setKeySequence(snapshot_.hotkey_toggle_connection);
+    ui->toggle_tun->setKeySequence(snapshot_.hotkey_toggle_tun);
 
     generateShortcutItems(actions);
+    bindHotkeyValidation();
 
     GetMainWindow()->RegisterHotkey(true);
     if (!GetMainWindow()->IsGlobalHotkeySupported()) {
@@ -33,12 +73,20 @@ DialogIntegration::DialogIntegration(QWidget *parent, const QList<QAction*>& act
     }
 
     setupApiTab();
+    // The Remote API reads the list split at commas and whitespace (RemoteApi::ConfigFromSettings).
+    form->bind(ui->api_allow, [](const QString &text) {
+        return Validation::EachItem(QString(text).replace(QLatin1Char(','), QLatin1Char(' ')), Validation::Split::Whitespace,
+                                    integrationAllowEntryError);
+    });
+    setupCoreApisTab();
+    bindCoreApiValidation();
 
     // Sized with the LAN warning shown, so selecting "Local network" later never needs a taller window.
     ui->api_lan_warning->setVisible(true);
     const auto *scr = screen() != nullptr ? screen() : QGuiApplication::primaryScreen();
     if (scr != nullptr) resize(sizeHint().boundedTo(scr->availableGeometry().size()));
     updateApiControls();
+    form->markAll();
 }
 
 void DialogIntegration::generateShortcutItems(const QList<QAction*>& actions)
@@ -52,19 +100,58 @@ void DialogIntegration::generateShortcutItems(const QList<QAction*>& actions)
         auto kseq = new QtExtKeySequenceEdit(this);
         if (!action->shortcut().isEmpty()) kseq->setKeySequence(action->shortcut());
         seqEdit2ID[kseq] = action->data().toString();
-        layout->addRow(action->text(), kseq);
+        // Menus share short texts such as "URL test"; the label names the menu path.
+        QString label = action->property("shortcutLabel").toString();
+        if (label.isEmpty()) label = action->text();
+        layout->addRow(label, kseq);
+        hotkeyEdits.append({kseq, label, false});
+    }
+}
+
+void DialogIntegration::bindHotkeyValidation()
+{
+    QList<HotkeyEdit> globals;
+    for (auto *edit : {ui->show_mainwindow, ui->show_groups, ui->show_routes, ui->system_proxy, ui->toggle_proxy, ui->toggle_connection, ui->toggle_tun})
+        globals.append({edit, integrationFieldLabel(ui->formLayout, edit), true});
+    hotkeyEdits = globals + hotkeyEdits;
+
+    for (const auto &field : std::as_const(hotkeyEdits)) {
+        // QKeySequenceEdit is its line edit's focus proxy: the line edit carries the mark, the edit reports when recording ends.
+        auto *display = field.edit->findChild<QLineEdit *>();
+        QWidget *target = display != nullptr ? static_cast<QWidget *>(display) : field.edit;
+        form->addRule({target}, [this, field] {
+            const auto key = field.edit->keySequence();
+            if (key.isEmpty()) return QString();
+            if (field.global) {
+                if (auto problem = integrationGlobalHotkeyError(key); !problem.isEmpty()) return problem;
+            }
+            for (const auto &other : std::as_const(hotkeyEdits)) {
+                if (other.edit != field.edit && other.edit->keySequence() == key)
+                    return tr("\"%1\" is also assigned to \"%2\".").arg(key.toString(QKeySequence::NativeText), other.label);
+            }
+            return QString();
+        }, this, Validation::Severity::Error, field.label);
+        const auto recheck = [this, target] {
+            form->revalidate(target);
+            form->refresh();
+        };
+        connect(field.edit, &QKeySequenceEdit::editingFinished, this, recheck);
+        connect(field.edit, &QKeySequenceEdit::keySequenceChanged, this, [recheck](const QKeySequence &key) {
+            if (key.isEmpty()) recheck();
+        });
     }
 }
 
 void DialogIntegration::setupApiTab()
 {
-    const auto &settings = Configs::dataManager->settingsRepo;
-    const auto key = RemoteApi::KeyFromText(settings->remote_api_key);
+    const auto &settings = snapshot_;
+    const auto key = RemoteApi::KeyFromText(settings.remote_api_key);
     savedApiKey = key.isEmpty() ? QString() : RemoteApi::KeyToText(key);
-    ui->api_enable->setChecked(settings->remote_api_enable);
-    ui->api_listen->setCurrentIndex(settings->remote_api_lan ? 1 : 0);
-    ui->api_port->setValue(IsValidPort(settings->remote_api_port) ? settings->remote_api_port : RemoteApi::kDefaultPort);
-    ui->api_allow->setText(settings->remote_api_allow);
+    ui->api_enable->setChecked(settings.remote_api_enable);
+    ui->api_listen->setCurrentIndex(settings.remote_api_lan ? 1 : 0);
+    ui->api_port->setValue(IsValidPort(settings.remote_api_port) ? settings.remote_api_port : RemoteApi::kDefaultPort);
+    ui->api_allow->setText(settings.remote_api_allow);
+    ui->api_admin_lan->setChecked(settings.remote_api_admin_lan);
     ui->api_key->setText(savedApiKey);
     if (ui->api_enable->isChecked() && savedApiKey.isEmpty()) ui->api_key->setText(RemoteApi::KeyToText(RemoteApi::GenerateKey()));
     ui->api_help->setText(tr("Scripts connect with thronectl or the Throne API library.").toHtmlEscaped()
@@ -98,13 +185,14 @@ void DialogIntegration::updateApiControls()
     }
     ui->api_allow_l->setEnabled(enabled && lan);
     ui->api_allow->setEnabled(enabled && lan);
+    ui->api_admin_lan->setEnabled(enabled && lan);
     ui->api_lan_warning->setVisible(enabled && lan);
 }
 
 void DialogIntegration::regenerateApiKey()
 {
     if (!savedApiKey.isEmpty() && ui->api_key->text() == savedApiKey) {
-        QMessageBox box(QMessageBox::Question, tr("Regenerate Key"), tr("Generate a new key?"), QMessageBox::Yes | QMessageBox::Cancel, this);
+        QMessageBox box(QMessageBox::Question, tr("Regenerate key"), tr("Generate a new key?"), QMessageBox::Yes | QMessageBox::Cancel, this);
         box.setInformativeText(tr("Scripts using the current key will stop working."));
         if (box.exec() != QMessageBox::Yes) return;
     }
@@ -120,64 +208,115 @@ void DialogIntegration::copyForScripts()
     QApplication::clipboard()->setText(QStringLiteral("THRONE_ADDR=%1:%2\nTHRONE_KEY=%3").arg(host, QString::number(ui->api_port->value()), ui->api_key->text()));
 }
 
-bool DialogIntegration::isValidAllowEntry(const QString &entry)
+void DialogIntegration::setupCoreApisTab()
 {
-    const auto host = entry.section('/', 0, 0);
-    // parseSubnet alone takes abbreviated IPv4 such as "10" for 10.0.0.0/8.
-    if (!host.contains(':') && host.count('.') != 3) return false;
-    const auto subnet = entry.contains('/') ? entry : entry + (host.contains(':') ? "/128" : "/32");
-    return QHostAddress::parseSubnet(subnet).second >= 0;
+    const auto &settings = snapshot_;
+    ui->core_box_clash_listen_addr->setText(settings.core_box_clash_listen_addr);
+    ui->core_box_clash_listen_addr->setPlaceholderText(tr("127.0.0.1 (default)"));
+    ui->core_box_clash_api->setValidator(new QIntValidator(1, 65535, ui->core_box_clash_api));
+    ui->core_box_clash_api->setText(settings.core_box_clash_api > 0 ? Int2String(settings.core_box_clash_api) : QString());
+    ui->core_box_clash_api_secret->setText(settings.core_box_clash_api_secret);
+
+    ui->core_box_api_port->setValidator(new QIntValidator(1, 65535, ui->core_box_api_port));
+    ui->core_box_api_port->setText(settings.core_box_api_port > 0 ? Int2String(settings.core_box_api_port) : QString());
+    ui->core_box_api_secret->setText(settings.core_box_api_secret);
+    connect(ui->core_box_api_regen, &QPushButton::clicked, this, [this] {
+        ui->core_box_api_secret->setText(QUuid::createUuid().toString(QUuid::WithoutBraces).remove('-'));
+    });
+}
+
+void DialogIntegration::bindCoreApiValidation()
+{
+    using namespace Validation;
+    const auto clashLabel = [this](const QLabel *label) { return QStringLiteral("%1 %2").arg(ui->clash_api_box->title(), label->text()); };
+    form->bind(ui->core_box_clash_listen_addr, Rules::Host(Empty::Allowed)).label(clashLabel(ui->core_box_clash_listen_addr_l));
+    form->bind(ui->core_box_clash_api, Rules::Port(Empty::Allowed)).label(clashLabel(ui->core_box_clash_api_l));
+    form->bind(ui->core_box_api_port, Rules::Port(Empty::Allowed))
+        .label(QStringLiteral("%1 %2").arg(ui->api_service_box->title(), ui->core_box_api_port_l->text()));
+
+    struct PortUse {
+        QWidget *widget;
+        QString name;
+        std::function<std::optional<qint64>()> port;
+    };
+    // The first two are this tab's own; the inbound ports come from saved settings, since Basic Settings edits them.
+    const QList<PortUse> ports = {
+        {ui->core_box_clash_api, tr("Clash API"), [this] { return ToInt(ui->core_box_clash_api->text()); }},
+        {ui->core_box_api_port, tr("sing-box API"), [this] { return ToInt(ui->core_box_api_port->text()); }},
+        {ui->api_port, tr("Throne API"), [this]() -> std::optional<qint64> {
+             if (!ui->api_enable->isChecked()) return std::nullopt;
+             return ui->api_port->value();
+         }},
+        {nullptr, tr("Mixed inbound"), []() -> std::optional<qint64> {
+             const auto &settings = Configs::dataManager->settingsRepo;
+             if (settings->disable_mixed_inbound || settings->random_inbound_port) return std::nullopt;
+             return settings->inbound_socks_port;
+         }},
+        {nullptr, tr("DNS server"), []() -> std::optional<qint64> {
+             const int port = Configs::dataManager->settingsRepo->core_dns_in_port;
+             if (port <= 0) return std::nullopt;
+             return port;
+         }},
+    };
+    for (qsizetype i = 0; i < 2; ++i) {
+        for (qsizetype j = i + 1; j < ports.size(); ++j) {
+            QList<QWidget *> participants{ports[i].widget};
+            if (ports[j].widget != nullptr) participants << ports[j].widget;
+            form->addRule(participants, [a = ports[i], b = ports[j]] {
+                const auto port = a.port();
+                if (!port || *port <= 0 || port != b.port()) return QString();
+                return tr("Port %1 is already used by: %2. Choose a different port.").arg(QString::number(*port), b.name);
+            }, nullptr, Severity::Error, ports[i].name);
+        }
+    }
+    connect(ui->api_enable, &QCheckBox::toggled, this, [this] {
+        form->revalidate(ui->core_box_clash_api);
+        form->revalidate(ui->core_box_api_port);
+        form->refresh();
+    });
 }
 
 void DialogIntegration::accept()
 {
-    QStringList invalid;
-    if (ui->api_allow->isEnabled()) {
-        static const QRegularExpression separators(QStringLiteral("[,\\s]+"));
-        for (const auto &entry : ui->api_allow->text().split(separators, Qt::SkipEmptyParts)) {
-            if (!isValidAllowEntry(entry)) invalid << entry;
-        }
-    }
-    if (!invalid.isEmpty()) {
-        ui->tabWidget->setCurrentWidget(ui->tab_api);
-        ui->api_allow->setFocus();
-        QMessageBox box(QMessageBox::Warning, tr("Allowed addresses"), tr("These entries are not IP addresses or CIDR ranges:") + "\n\n" + invalid.join('\n'), QMessageBox::Ok, this);
-        box.setTextFormat(Qt::PlainText);
-        box.exec();
-        return;
-    }
+    if (!form->validateAll()) return;
 
-    const auto &settings = Configs::dataManager->settingsRepo;
-    settings->hotkey_mainwindow = ui->show_mainwindow->keySequence().toString();
-    settings->hotkey_group = ui->show_groups->keySequence().toString();
-    settings->hotkey_route = ui->show_routes->keySequence().toString();
-    settings->hotkey_system_proxy_menu = ui->system_proxy->keySequence().toString();
-    settings->hotkey_toggle_system_proxy = ui->toggle_proxy->keySequence().toString();
-    settings->hotkey_toggle_connection = ui->toggle_connection->keySequence().toString();
-    settings->hotkey_toggle_tun = ui->toggle_tun->keySequence().toString();
+    Configs::SettingsValues proposed = snapshot_;
+    proposed.hotkey_mainwindow = ui->show_mainwindow->keySequence().toString();
+    proposed.hotkey_group = ui->show_groups->keySequence().toString();
+    proposed.hotkey_route = ui->show_routes->keySequence().toString();
+    proposed.hotkey_system_proxy_menu = ui->system_proxy->keySequence().toString();
+    proposed.hotkey_toggle_system_proxy = ui->toggle_proxy->keySequence().toString();
+    proposed.hotkey_toggle_connection = ui->toggle_connection->keySequence().toString();
+    proposed.hotkey_toggle_tun = ui->toggle_tun->keySequence().toString();
 
     auto mp = seqEdit2ID.toStdMap();
     for (const auto& [kseq, actionID] : mp)
     {
-        settings->shortcuts[actionID] = kseq->keySequence();
+        proposed.shortcuts[actionID] = kseq->keySequence();
     }
 
-    const bool apiEnable = ui->api_enable->isChecked();
-    const bool apiLan = ui->api_listen->currentIndex() == 1;
-    const int apiPort = ui->api_port->value();
-    const auto apiKey = ui->api_key->text();
-    const auto apiAllow = ui->api_allow->text().trimmed();
-    const bool apiChanged = apiEnable != settings->remote_api_enable || apiLan != settings->remote_api_lan || apiPort != settings->remote_api_port
-                            || apiKey != settings->remote_api_key || apiAllow != settings->remote_api_allow;
-    settings->remote_api_enable = apiEnable;
-    settings->remote_api_lan = apiLan;
-    settings->remote_api_port = apiPort;
-    settings->remote_api_key = apiKey;
-    settings->remote_api_allow = apiAllow;
-    settings->Save();
+    proposed.remote_api_enable = ui->api_enable->isChecked();
+    proposed.remote_api_lan = ui->api_listen->currentIndex() == 1;
+    proposed.remote_api_port = ui->api_port->value();
+    proposed.remote_api_key = ui->api_key->text();
+    proposed.remote_api_allow = ui->api_allow->text().trimmed();
+    proposed.remote_api_admin_lan = ui->api_admin_lan->isChecked();
 
-    MW_dialog_message(MwMessage::UpdateShortcuts, {});
-    if (apiChanged) MW_dialog_message(MwMessage::UpdateSettings, {MwArg::RemoteApi});
+    // A stored port <= 0 is off, the same as an empty field, so an empty field keeps it as stored.
+    const auto portOrOff = [](int field, int stored) { return field > 0 || stored > 0 ? field : stored; };
+    proposed.core_box_clash_listen_addr = ui->core_box_clash_listen_addr->text().trimmed();
+    proposed.core_box_clash_api = portOrOff(ui->core_box_clash_api->text().trimmed().toInt(), snapshot_.core_box_clash_api);
+    proposed.core_box_clash_api_secret = ui->core_box_clash_api_secret->text().trimmed();
+    proposed.core_box_api_port = portOrOff(ui->core_box_api_port->text().trimmed().toInt(), snapshot_.core_box_api_port);
+    auto boxApiSecret = ui->core_box_api_secret->text().trimmed();
+    // Blank means "no authentication" to sing-box, so never let the field clear it.
+    if (boxApiSecret.isEmpty()) boxApiSecret = snapshot_.core_box_api_secret;
+    proposed.core_box_api_secret = boxApiSecret;
+
+    if (const auto error = Engine::SettingsService::ApplyEdit(snapshot_, proposed, {.interactive = true})) {
+        MessageBoxWarning(windowTitle(), SettingsApplyErrorText(*error));
+        return;
+    }
     const auto failures = GetMainWindow()->RegisterHotkey(false);
     if (!failures.isEmpty() && GetMainWindow()->IsGlobalHotkeySupported()) {
         QMessageBox box(QMessageBox::Warning, tr("Hotkey"), tr("These global hotkeys could not be registered:") + "\n\n" + failures.join('\n'), QMessageBox::Ok, this);

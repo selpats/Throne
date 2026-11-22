@@ -9,18 +9,17 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"ThroneCore/internal/pfctl"
 )
 
 const pfTamperedMessage = "pf was disabled or the kill switch rules were removed by another program"
-
-var pfTokenPattern = regexp.MustCompile(`(?m)^Token\s*:\s*(\d+)\s*$`)
 
 type pfBackend struct {
 	cfg      *config
@@ -85,16 +84,9 @@ func (b *pfBackend) arm() error {
 		return newError(CodeInternal, "lock %s: %w", lock.Name(), err)
 	}
 
-	// -E takes a reference-counted enable; -e and -d would switch pf for its other users too.
-	enable, err := pfctl(nil, "-E")
-	if match := pfTokenPattern.FindStringSubmatch(enable.stderr + "\n" + enable.stdout); match != nil {
-		b.token, b.tokenPID = match[1], strconv.Itoa(enable.pid)
-	}
+	b.token, b.tokenPID, err = pfctl.Enable()
 	if err != nil {
 		return newError(CodeInternal, "enable pf: %w", err)
-	}
-	if b.token == "" {
-		return newError(CodeInternal, "enable pf: pfctl printed no reference token")
 	}
 	if _, err = fmt.Fprintf(lock, "%s %s\n", b.token, b.tokenPID); err != nil {
 		return newError(CodeInternal, "record the pf token: %w", err)
@@ -108,9 +100,11 @@ func (b *pfBackend) arm() error {
 	if err = checkMainRuleset(); err != nil {
 		return err
 	}
-	// pf states bypass rule evaluation: flows opened before arming would keep flowing.
-	if _, err = pfctl(nil, "-F", "states"); err != nil {
-		return newError(CodeInternal, "flush the pf states: %w", err)
+	// pf states bypass rule evaluation; a replacing guard keeps them (the API pass's) only if its predecessor never stopped blocking.
+	if !b.cfg.KeepStates || !liveGuardAnchor(b.id) {
+		if _, err = pfctl.Run(nil, "-F", "states"); err != nil {
+			return newError(CodeInternal, "flush the pf states: %w", err)
+		}
 	}
 	cleanupStale(b.id)
 	log.Printf("guard: pf anchor %s armed, tun %v", b.anchor, b.tuns)
@@ -132,9 +126,9 @@ func (b *pfBackend) teardown() {
 		return
 	}
 	if b.loaded {
-		err := flushAnchor(b.anchor)
+		err := pfctl.FlushAnchor(b.anchor)
 		if err != nil {
-			err = flushAnchor(b.anchor)
+			err = pfctl.FlushAnchor(b.anchor)
 		}
 		if err != nil {
 			log.Printf("guard: %v", err)
@@ -142,7 +136,7 @@ func (b *pfBackend) teardown() {
 		b.loaded = false
 	}
 	if b.token != "" {
-		if err := releaseToken(b.token, b.tokenPID); err != nil {
+		if err := pfctl.ReleaseToken(b.token, b.tokenPID); err != nil {
 			log.Printf("guard: release the pf reference: %v", err)
 		}
 		b.token = ""
@@ -155,7 +149,7 @@ func (b *pfBackend) teardown() {
 }
 
 func (b *pfBackend) load(tuns []string) error {
-	_, err := pfctl([]byte(pfRuleset(b.cfg, tuns)), "-o", "none", "-a", b.anchor, "-f", "-")
+	_, err := pfctl.Run([]byte(pfRuleset(b.cfg, tuns)), "-o", "none", "-a", b.anchor, "-f", "-")
 	return err
 }
 
@@ -196,7 +190,7 @@ func (b *pfBackend) watchdog() {
 			retried = false
 			continue
 		}
-		if errors.Is(err, errPfctlIncomplete) && !retried {
+		if errors.Is(err, pfctl.ErrIncomplete) && !retried {
 			retried = true
 			log.Printf("guard: pf check did not finish, retrying: %v", err)
 			continue
@@ -211,30 +205,30 @@ func (b *pfBackend) watchdog() {
 }
 
 func (b *pfBackend) verify() error {
-	info, err := pfctl(nil, "-s", "info")
+	info, err := pfctl.Run(nil, "-s", "info")
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(info.stdout, "Status: Enabled") {
+	if !strings.Contains(info.Stdout, "Status: Enabled") {
 		return errors.New("pf is disabled")
 	}
-	rules, err := pfctl(nil, "-a", b.anchor, "-s", "rules")
+	rules, err := pfctl.Run(nil, "-a", b.anchor, "-s", "rules")
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(rules.stdout) == "" {
+	if strings.TrimSpace(rules.Stdout) == "" {
 		return fmt.Errorf("pf anchor %s is empty", b.anchor)
 	}
 	return checkMainRuleset()
 }
 
 func checkMainRuleset() error {
-	rules, err := pfctl(nil, "-s", "rules")
+	rules, err := pfctl.Run(nil, "-s", "rules")
 	if err != nil {
 		return newError(CodeInternal, "read the pf main ruleset: %w", err)
 	}
-	for line := range strings.Lines(rules.stdout) {
-		if strings.HasPrefix(strings.TrimSpace(line), `anchor "`+pfRootAnchor+`/*"`) {
+	for line := range strings.Lines(rules.Stdout) {
+		if strings.HasPrefix(strings.TrimSpace(line), `anchor "`+pfctl.RootAnchor+`/*"`) {
 			return nil
 		}
 	}
@@ -258,6 +252,10 @@ func pfRuleset(cfg *config, tuns []string) string {
 	add("pass out quick inet6 proto udp from any port 546 to any port 547 no state")
 	add("pass out quick inet6 proto 58 all icmp6-type { 130 131 132 133 134 135 136 137 143 } no state")
 	add("pass out quick inet proto 2 from any to 224.0.0.0/4 no state")
+	if cfg.APIPort != 0 {
+		// The state an inbound connection creates carries the API's replies past the final block.
+		add("pass in quick proto tcp from any to any port %d keep state", cfg.APIPort)
+	}
 	if cfg.AllowLAN {
 		var ports []string
 		for _, port := range lanDNSPorts {

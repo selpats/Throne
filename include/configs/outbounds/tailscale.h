@@ -6,7 +6,8 @@ namespace Configs
     class tailscale : public outbound
     {
         public:
-        QString state_directory = "$HOME/.tailscale";
+        bool HasServerEndpoint() override { return false; }
+
         QString auth_key;
         QString control_url = "https://controlplane.tailscale.com";
         bool ephemeral = false;
@@ -30,7 +31,15 @@ namespace Configs
         QString DisplayType() override;
         SecurityInfo GetSecurity() override;
         bool IsEndpoint() override;
+        void Validate(Validation::Issues& issues) override;
     };
+
+    namespace Checks {
+        QString TailscaleControlUrl(const QString& text);
+        // One advertised route: a prefix, and not the default route.
+        QString TailscaleRoute(const QString& item);
+        QString TailscaleExitNode(const QString& exitNode, bool advertiseExitNode);
+    }
 }
 
 

@@ -2,13 +2,28 @@
 #include "include/global/Configs.hpp"
 #include "include/database/entities/Profile.h"
 #include "include/configs/common/Outbound.h"
+#include "include/ui/setting/ThemeManager.hpp"
+#include "include/ui/utils/ServiceCheckHtml.h"
 #include <QApplication>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMimeData>
 #include <QPalette>
+#include <QRegularExpression>
+#include <algorithm>
 
 #include "include/configs/generate.h"
 #include "include/database/GroupsRepo.h"
 #include "include/database/ProfilesRepo.h"
+#include "include/engine/Lifecycle.h"
+
+namespace {
+    bool showsServices(const Configs::Profile &profile) {
+        const auto group = Configs::dataManager->groupsRepo->GetGroup(profile.gid);
+        return group == nullptr || group->show_services;
+    }
+}
 
 ProfilesTableModel::ProfilesTableModel(QObject *parent)
     : QAbstractTableModel(parent) {}
@@ -90,15 +105,25 @@ QVariant ProfilesTableModel::data(const QModelIndex &index, int role) const {
     if (role == ProfileIdRole) {
         return profileId;
     }
+    if (role == PinnedRole) {
+        return isPinnedRow(index.row());
+    }
     ensureCached(profileId);
     auto it = m_cache.constFind(profileId);
     if (it == m_cache.constEnd()) return {};
     const std::shared_ptr<Configs::Profile> &profile = it.value();
     if (!profile) return {};
+    if (role == ServiceItemsRole) {
+        if (index.column() != ColTestResult || !showsServices(*profile)) return {};
+        return QVariant::fromValue(ServiceCheckHtml::items(*profile));
+    }
 
-    const int startedId = Configs::dataManager->settingsRepo->started_id;
+    const int startedId = Engine::Lifecycle::ResumeTargetId();
     const bool isRunning = (profile->id == startedId);
-    QColor linkColor = isRunning ? QApplication::palette().link().color() : QColor();
+    const ThemeTokens &tokens = themeManager()->tokens;
+    QColor linkColor = !isRunning                  ? QColor()
+                       : tokens.runningRow.isValid() ? tokens.onRunningRow
+                                                     : QApplication::palette().link().color();
 
     if (role == Qt::DisplayRole) {
         switch (index.column()) {
@@ -125,8 +150,12 @@ QVariant ProfilesTableModel::data(const QModelIndex &index, int role) const {
     if (role == Qt::ToolTipRole) {
         if (index.column() == ColType && Configs::dataManager->settingsRepo->show_config_security && profile->outbound) {
             const auto security = profile->outbound->EffectiveSecurity();
-            if (security.compromised) return tr("Certificate checks are turned off by the \"Skip TLS certificate authentication\" setting.");
+            if (security.compromised) return tr("Certificate checks off: \"Skip TLS certificate authentication\" is "
+                                                "set.");
             if (security.isDangerous()) return tr("This config's traffic is not properly protected.");
+        }
+        if (index.column() == ColTestResult && !profile->service_checks.isEmpty() && showsServices(*profile)) {
+            return ServiceCheckHtml::summaryLine(*profile);
         }
         return {};
     }
@@ -137,6 +166,9 @@ QVariant ProfilesTableModel::data(const QModelIndex &index, int role) const {
         }
         if (isRunning && linkColor.isValid()) return linkColor;
         return {};
+    }
+    if (role == Qt::BackgroundRole && isRunning && tokens.runningRow.isValid()) {
+        return tokens.runningRow;
     }
     return {};
 }
@@ -156,9 +188,11 @@ QVariant ProfilesTableModel::headerData(int section, Qt::Orientation orientation
     return {};
 }
 
-void ProfilesTableModel::setProfileIds(const QList<int> &ids) {
+void ProfilesTableModel::setProfileIds(const QList<int> &ids, int pinnedCount) {
+    const int oldPinned = m_pinnedCount;
     beginResetModel();
     m_profileIds = ids;
+    m_pinnedCount = std::clamp(pinnedCount, 0, static_cast<int>(ids.size()));
     id2row.clear();
     int idx=0;
     for (const auto &id : ids) {
@@ -170,13 +204,51 @@ void ProfilesTableModel::setProfileIds(const QList<int> &ids) {
     m_filterKeys.clear();
     m_filterIndexBuilt = false;
     endResetModel();
+    if (m_pinnedCount != oldPinned) emit pinnedCountChanged();
+}
+
+void ProfilesTableModel::setPinnedCount(int count) {
+    count = std::clamp(count, 0, static_cast<int>(m_profileIds.size()));
+    if (count == m_pinnedCount) return;
+    m_pinnedCount = count;
+    emit pinnedCountChanged();
 }
 
 namespace {
+    QList<ProfilesTableModel::ServiceFilterKey> serviceFilterKeys(const QString &serviceChecks) {
+        if (serviceChecks.isEmpty()) return {};
+        const auto root = QJsonDocument::fromJson(serviceChecks.toUtf8()).object();
+        if (!root["error"].toString().isEmpty()) return {};
+        QHash<QString, QString> categoryNames;
+        for (const auto &value : root["cats"].toArray()) {
+            const auto category = value.toObject();
+            categoryNames.insert(category["id"].toString(), category["name"].toString());
+        }
+        static const QRegularExpression separators(QStringLiteral("[^\\p{L}\\p{N}]+"));
+        const auto &disabled = Configs::dataManager->settingsRepo->service_check_disabled;
+        QList<ProfilesTableModel::ServiceFilterKey> services;
+        for (const auto &value : root["checks"].toArray()) {
+            const auto check = value.toObject();
+            if (disabled.contains(check["id"].toString())) continue;
+            const auto category = check["cat"].toString();
+            const auto status = check["status"].toString();
+            ProfilesTableModel::ServiceFilterKey service;
+            service.state = status == "available" || status == "partial" ? 1 : status == "restricted" || status == "blocked" ? -1 : 0;
+            for (const auto &name : {check["id"].toString(), check["name"].toString(), category, categoryNames.value(category)}) {
+                if (name.isEmpty()) continue;
+                service.names << name.toLower();
+                service.words << name.toLower().split(separators, Qt::SkipEmptyParts);
+            }
+            services << service;
+        }
+        return services;
+    }
+
     ProfilesTableModel::FilterKey makeFilterKey(const std::shared_ptr<Configs::Profile> &profile) {
         ProfilesTableModel::FilterKey key;
         key.type = profile->type;
         key.country = profile->test_country;
+        key.services = serviceFilterKeys(profile->service_checks);
         if (profile->outbound) {
             key.address = profile->outbound->server;
             key.effectiveAddress = Configs::EffectiveEndpointHost(profile);
@@ -204,17 +276,15 @@ const ProfilesTableModel::FilterKey *ProfilesTableModel::filterKeyAt(int row) co
     return it == m_filterKeys.constEnd() ? nullptr : &it.value();
 }
 
-void ProfilesTableModel::refreshTable(const QList<int> &ids, bool mayNeedReset) {
+void ProfilesTableModel::refreshTable(const QList<int> &ids, int pinnedCount, bool mayNeedReset) {
     if (m_profileIds.isEmpty() && ids.isEmpty()) return;
 
-    const bool needFullReset = mayNeedReset && (
-    ids.size() != m_profileIds.size() ||
-    !std::equal(ids.begin(), ids.end(), m_profileIds.begin())
-    );
-
-    if (needFullReset) {
-        setProfileIds(ids);
+    const bool sameOrder = ids == m_profileIds;
+    if (mayNeedReset && !sameOrder) {
+        setProfileIds(ids, pinnedCount);
     } else {
+        // A stale order keeps its own count until the reset that replaces it.
+        if (sameOrder) setPinnedCount(pinnedCount);
         m_addressCache.clear();
         m_filterKeys.clear();
         m_filterIndexBuilt = false;
@@ -249,16 +319,22 @@ void ProfilesTableModel::invalidateAddresses() {
     emit dataChanged(index(0, ColAddress), index(static_cast<int>(m_profileIds.size()) - 1, ColAddress), {Qt::DisplayRole});
 }
 
-void ProfilesTableModel::emplaceProfiles(int row1, int row2) {
-    if (m_profileIds.size() <= row1 || m_profileIds.size() <= row2) return;
-    m_profileIds.insert(row2+1, m_profileIds[row1]);
-    if (row1 < row2) m_profileIds.remove(row1);
-    else m_profileIds.remove(row1+1);
+void ProfilesTableModel::moveProfile(int from, int to, int pinnedCount) {
+    const auto count = static_cast<int>(m_profileIds.size());
+    if (from < 0 || to < 0 || from >= count || to >= count) return;
+    m_profileIds.move(from, to);
+    int first = std::min(from, to);
+    int last = std::max(from, to);
+    for (int i = first; i <= last; ++i) id2row[m_profileIds[i]] = i;
 
-    const int from = std::max(std::min(row1, row2), 0);
-    const int to = std::min(std::max(row1, row2), static_cast<int>(m_profileIds.size()) - 1);
-    for (int i = from; i <= to; ++i) id2row[m_profileIds[i]] = i;
-    for (int i = from; i <= to; ++i) refreshProfileId(m_profileIds[i]);
+    const int oldPinned = m_pinnedCount;
+    setPinnedCount(pinnedCount);
+    if (m_pinnedCount != oldPinned) {
+        // The divider under the last pinned row moves with the count.
+        first = std::max(std::min({first, oldPinned - 1, m_pinnedCount - 1}), 0);
+        last = std::max({last, oldPinned - 1, m_pinnedCount - 1});
+    }
+    emit dataChanged(index(first, 0), index(last, ColumnCount - 1));
 }
 
 int ProfilesTableModel::indexOfProfile(int id) {
@@ -266,10 +342,44 @@ int ProfilesTableModel::indexOfProfile(int id) {
     return -1;
 }
 
+int ProfilesTableModel::columnOfSort(GroupSortMethod::GroupSortMethod method) {
+    switch (method) {
+    case GroupSortMethod::ByType:
+    case GroupSortMethod::BySecurity: return ColType;
+    case GroupSortMethod::ByAddress: return ColAddress;
+    case GroupSortMethod::ByName: return ColName;
+    case GroupSortMethod::ByTestResult:
+    case GroupSortMethod::ByLatency: return ColTestResult;
+    case GroupSortMethod::ByTraffic: return ColTraffic;
+    default: return -1;
+    }
+}
+
+GroupSortMethod::GroupSortMethod ProfilesTableModel::sortOfColumn(int column) {
+    switch (column) {
+    case ColType: return GroupSortMethod::ByType;
+    case ColAddress: return GroupSortMethod::ByAddress;
+    case ColName: return GroupSortMethod::ByName;
+    case ColTestResult: return GroupSortMethod::ByTestResult;
+    case ColTraffic: return GroupSortMethod::ByTraffic;
+    default: return GroupSortMethod::Raw;
+    }
+}
+
+bool ProfilesTableModel::isStartedRow(int sourceRow) const {
+    return sourceRow >= 0 && sourceRow < m_profileIds.size()
+        && m_profileIds[sourceRow] == Engine::Lifecycle::ResumeTargetId();
+}
+
+bool ProfilesTableModel::endsPinnedBlock(const QModelIndex &index) {
+    if (!index.data(PinnedRole).toBool()) return false;
+    const QModelIndex next = index.siblingAtRow(index.row() + 1);
+    return next.isValid() && !next.data(PinnedRole).toBool();
+}
+
 QString ProfilesTableModel::rowLabel(int sourceRow, int displayRow) const {
     if (sourceRow < 0 || sourceRow >= m_profileIds.size()) return {};
-    int id = m_profileIds[sourceRow];
-    if (Configs::dataManager->settingsRepo->started_id == id) {
+    if (isStartedRow(sourceRow)) {
         return QStringLiteral("✓");
     }
     return QString::number(displayRow + 1) + QStringLiteral("  ");

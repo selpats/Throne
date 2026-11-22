@@ -3,6 +3,8 @@
 #ifndef Q_MOC_RUN
 #include <core/gen/libcore.pb.h>
 #endif
+#include <optional>
+
 #include <QByteArray>
 #include <QMap>
 #include <QString>
@@ -11,6 +13,22 @@
 class QLocalSocket;
 
 namespace API {
+    // The core's privilege report. The optionals are unset where the core cannot tell (another OS, an older core).
+    struct PrivilegeInfo {
+        // euid 0 or the Tun capabilities (Linux), an elevated token (Windows), as IsPrivileged always meant.
+        bool privileged = false;
+        // Linux: /dev/net/tun opened read-write.
+        std::optional<bool> tunDevice;
+        // Linux: CAP_NET_ADMIN in the effective set.
+        std::optional<bool> netAdmin;
+        // Linux: euid 0 and CAP_NET_ADMIN; macOS: euid 0; Windows: an elevated token.
+        std::optional<bool> killSwitch;
+        // The first failing reason, plain English; empty when nothing failed.
+        QString detail;
+        // The answering core's own pid; on Windows the elevated core, not the stub Throne started. 0 = an older core.
+        qint64 corePid = 0;
+    };
+
     class Client {
     public:
         Client();
@@ -26,7 +44,8 @@ namespace API {
 
         QString Start(bool *rpcOK, const libcore::LoadConfigReq &request);
 
-        QString Stop(bool *rpcOK);
+        // timeoutMs 0 = the channel default.
+        QString Stop(bool *rpcOK, int timeoutMs = 0);
 
         libcore::QueryStatsResp QueryStats();
 
@@ -41,29 +60,45 @@ namespace API {
 
         libcore::QueryIPTestResponse QueryIPTest(bool *rpcOK);
 
+        libcore::ServiceTestResponse ServiceTest(bool *rpcOK, const libcore::ServiceTestRequest &request, QString *coreError = nullptr, int timeoutMs = 0);
+
+        libcore::QueryServiceTestResponse QueryServiceTest(bool *rpcOK);
+
+        // Empty checks describes the core's embedded definitions; a non-empty reply.error rejects the document.
+        libcore::ParseServiceChecksResponse ParseServiceChecks(bool *rpcOK, const QByteArray &checks, QString *coreError = nullptr);
+
         [[nodiscard]] libcore::QueryConnectionsResp QueryConnections() const;
 
         // Ids already gone are a no-op; closedCount (optional) receives how many were actually live.
         QString CloseConnections(bool *rpcOK, const QStringList &ids, int *closedCount = nullptr) const;
 
+        [[nodiscard]] libcore::ListProcessesResponse ListProcesses(bool *rpcOK) const;
+
         QString UpdateRuleSets(bool *rpcOK, int *updatedCount = nullptr) const;
 
         QString CheckConfig(bool *rpcOK, const QString& config, bool isXray = false) const;
 
-        bool IsPrivileged(bool *rpcOK) const;
+        // timeoutMs 0 = the channel default.
+        bool IsPrivileged(bool *rpcOK, int timeoutMs = 0) const;
+
+        // IsPrivileged with the core's capability fields (IsPrivilegedResponse 2-5).
+        PrivilegeInfo Privileges(bool *rpcOK, int timeoutMs = 0) const;
 
         libcore::SpeedTestResponse SpeedTest(bool *rpcOK, const libcore::SpeedTestRequest &request, QString *coreError = nullptr);
 
         libcore::QuerySpeedTestResponse QueryCurrentSpeedTests(bool *rpcOK);
 
-        libcore::QueryCountryTestResponse QueryCountryTestResults(bool *rpcOK);
-
         libcore::GenWgKeyPairResponse GenWgKeyPair(bool *rpcOK);
 
         libcore::WarpRegisterResponse WarpRegister(bool *rpcOK, const QString &tunnelType, const QString &proxy,
-                                                   const QStringList &apiHosts);
+                                                   const QStringList &apiHosts, bool tlsFragment, bool tlsRecordFragment,
+                                                   const QString &tlsFragmentFallbackDelay);
+
+        libcore::GenQuicSignatureResponse GenQuicSignature(bool *rpcOK, const QString &domain);
 
         QString InstallDashboard(bool *rpcOK, const QString &archivePath, const QString &targetDir) const;
+
+        QString InstallTor(bool *rpcOK, const QString &archivePath, const QString &sha256) const;
 
         // Empty name = the OS has no default route.
         [[nodiscard]] libcore::GetDefaultInterfaceResponse GetDefaultInterface(bool *rpcOK) const;
@@ -105,6 +140,13 @@ namespace API {
 
         // Returns the error text; empty on success.
         QString ParseRuleSet(bool *rpcOK, const QByteArray &content, QStringList *cidrs, int *skippedRules = nullptr) const;
+
+        // Through the core's dns-direct; config is the probe box it starts when the running profile has none.
+        libcore::ResolveDomainsResponse ResolveDomains(bool *rpcOK, const QStringList &domains, const QString &config,
+                                                       QString *coreError = nullptr) const;
+
+        // An empty request.config tests the running instance.
+        libcore::TestRouteResponse TestRoute(bool *rpcOK, const libcore::TestRouteRequest &request, QString *coreError = nullptr) const;
 
     private:
         class LocalSocketChannel;

@@ -27,6 +27,7 @@ const (
 	weightLANDNS   = 12
 	weightLAN      = 11
 	weightLink     = 10
+	weightAPI      = 9
 	weightBlock    = 0
 )
 
@@ -78,9 +79,19 @@ type wfpBackend struct {
 	tunFilters []uint64
 }
 
+// Not GetCurrentProcessToken: that pseudo-handle needs Windows 8, and on Windows 7 every query through it fails.
+func tokenElevated() bool {
+	var token windows.Token
+	if windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token) != nil {
+		return false
+	}
+	defer token.Close()
+	return token.IsElevated()
+}
+
 func newBackend() (backend, error) {
-	if !windows.GetCurrentProcessToken().IsElevated() {
-		return nil, newError(CodePrivilege, "the kill switch needs Throne to run as administrator")
+	if !tokenElevated() {
+		return nil, newError(CodePrivilege, "the kill switch needs the core to run with administrator rights")
 	}
 	return &wfpBackend{stop: make(chan struct{})}, nil
 }
@@ -102,7 +113,7 @@ func (b *wfpBackend) Arm(cfg *config, events chan<- Event) error {
 			return err
 		}
 	}
-	if err = b.arm(cfg.AllowLAN, tuns, appIDs); err != nil {
+	if err = b.arm(cfg, tuns, appIDs); err != nil {
 		return err
 	}
 	if len(skipped) > 0 {
@@ -126,7 +137,7 @@ func (b *wfpBackend) Arm(cfg *config, events chan<- Event) error {
 	return nil
 }
 
-func (b *wfpBackend) arm(allowLAN bool, tuns []tunAdapter, appIDs []*fwpByteBlob) error {
+func (b *wfpBackend) arm(cfg *config, tuns []tunAdapter, appIDs []*fwpByteBlob) error {
 	b.access.Lock()
 	defer b.access.Unlock()
 	session := fwpmSession0{
@@ -151,7 +162,7 @@ func (b *wfpBackend) arm(allowLAN bool, tuns []tunAdapter, appIDs []*fwpByteBlob
 		if err = b.addSublayer(); err != nil {
 			return err
 		}
-		if _, err = b.install(baseRules(allowLAN, appIDs, &pin)); err != nil {
+		if _, err = b.install(baseRules(cfg, appIDs, &pin)); err != nil {
 			return err
 		}
 		if b.blockAll, err = b.install(blockRules()); err != nil {
@@ -353,6 +364,18 @@ func resolveAppIDs(extraPaths []string) (appIDs []*fwpByteBlob, skipped []string
 		}
 		appIDs = append(appIDs, appID)
 	}
+	known := append([]string{self}, extraPaths...)
+	for _, path := range permittedExecutables {
+		if slices.ContainsFunc(known, func(other string) bool { return strings.EqualFold(other, path) }) {
+			continue
+		}
+		known = append(known, path)
+		if appID, err = appIDFromFile(path); err != nil {
+			skipped = append(skipped, fmt.Sprintf("%s (%v)", path, err))
+			continue
+		}
+		appIDs = append(appIDs, appID)
+	}
 	return appIDs, skipped, nil
 }
 
@@ -397,7 +420,7 @@ func isTunAlias(alias, name string) bool {
 	return ok && err == nil
 }
 
-func baseRules(allowLAN bool, appIDs []*fwpByteBlob, pin *runtime.Pinner) []wfpRule {
+func baseRules(cfg *config, appIDs []*fwpByteBlob, pin *runtime.Pinner) []wfpRule {
 	apps := make([]fwpmFilterCondition0, len(appIDs))
 	for i, appID := range appIDs {
 		apps[i] = condition(conditionALEAppID, fwpMatchEqual, fwpByteBlobType, uintptr(unsafe.Pointer(appID)))
@@ -408,7 +431,13 @@ func baseRules(allowLAN bool, appIDs []*fwpByteBlob, pin *runtime.Pinner) []wfpR
 			condition(conditionFlags, fwpMatchFlagsAllSet, fwpUint32, fwpConditionFlagIsLoopback),
 		}},
 	}
-	if allowLAN {
+	if cfg.APIPort != 0 {
+		// ALE authorizes the whole flow: an accepted connection's replies never reach the connect layer's block.
+		rules = append(rules, wfpRule{"permit the Throne API", []windows.GUID{layerALEAuthRecvAcceptV4, layerALEAuthRecvAcceptV6}, weightAPI, fwpActionPermit, []fwpmFilterCondition0{
+			equal8(conditionIPProtocol, ipProtoTCP), equal16(conditionIPLocalPort, cfg.APIPort),
+		}})
+	}
+	if cfg.AllowLAN {
 		rules = append(rules, lanRules(pin)...)
 	}
 	return append(rules, linkRules(pin)...)

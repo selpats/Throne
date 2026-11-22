@@ -4,6 +4,7 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QFile>
 #include <QGuiApplication>
 #include <QItemSelectionModel>
@@ -14,9 +15,12 @@
 #include <QMutex>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QScreen>
 #include <QScrollBar>
+#include <QTabWidget>
 #include <QThread>
 #include <QThreadPool>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -28,25 +32,37 @@
 
 #include "include/ui/utils/ScreenQrScanner.h"
 
+#include "include/api/RPC.h"
 #include "include/configs/generate.h"
 #include "include/configs/sub/GroupUpdater.hpp"
 #include "include/database/GroupsRepo.h"
 #include "include/database/ProfilesRepo.h"
+#include "include/engine/EngineHost.h"
+#include "include/engine/Lifecycle.h"
+#include "include/engine/services/ProfileService.h"
+#include "include/global/OtpPlaceholder.hpp"
 #include "include/ui/mainWindow/MainWindowInternal.h"
 #include "include/ui/profile/dialog_edit_profile.h"
 #include "include/ui/utils/ProfilesTableModel.h"
+#include "include/ui/widget/json/JsonCodeEdit.h"
 
 namespace {
     constexpr int removeListPreviewLimit = 20;
+
+    void reportProfileDeleteRefusal(const Engine::ServiceError &error) {
+        if (error.code == QLatin1String("editing")) {
+            MessageBoxWarning(software_name, MainWindow::tr("One of the profiles to delete is open in an editor. Close it first."));
+        } else {
+            MW_show_log(error.message);
+        }
+    }
 }
 
 void MainWindow::on_profilesTableView_doubleClicked(const QModelIndex &index) {
     if (!index.isValid() || !profilesTableModel) return;
     int id = index.data(ProfilesTableModel::ProfileIdRole).toInt();
     if (select_mode) {
-        emit profile_selected(id);
-        select_mode = false;
-        refresh_status();
+        finish_select_mode(id);
         return;
     }
     auto dialog = new DialogEditProfile("", id, this);
@@ -71,6 +87,32 @@ void MainWindow::on_menu_clone_triggered() {
     if (btn != QMessageBox::Yes) return;
 
     Subscription::updater()->CloneProfiles(entIDs);
+}
+
+void MainWindow::refresh_pin_action() {
+    const auto group = Configs::dataManager->groupsRepo->CurrentGroup();
+    const auto selected = get_now_selected_list();
+    const bool unpin = group != nullptr && !selected.isEmpty()
+                       && std::ranges::all_of(selected, [&group](int id) { return group->IsPinned(id); });
+    ui->menu_pin->setText(unpin ? tr("Unpin") : tr("Pin to top"));
+}
+
+void MainWindow::on_menu_pin_triggered() {
+    const auto group = Configs::dataManager->groupsRepo->CurrentGroup();
+    const auto selected = get_now_selected_list();
+    if (group == nullptr || selected.isEmpty()) return;
+
+    QList<int> unpinned;
+    if (std::ranges::all_of(selected, [&group](int id) { return group->IsPinned(id); })) {
+        unpinned = group->UnpinProfiles(selected);
+        if (unpinned.isEmpty()) return;
+    } else if (!group->PinProfiles(selected)) {
+        return;
+    }
+    Configs::dataManager->groupsRepo->Save(group);
+    refresh_proxy_list({}, true);
+    // They wait at the top of the unpinned rows until a kept sort places them.
+    if (!unpinned.isEmpty()) Configs::RepositionLater(QHash<int, QList<int>>{{group->id, unpinned}}, Configs::SortInput::Membership);
 }
 
 void MainWindow::on_menu_delete_repeat_triggered() {
@@ -111,22 +153,30 @@ void MainWindow::on_menu_delete_repeat_triggered() {
     const auto removed_rows = groupIds.size() - newOrder.size();
     if (removed_rows == 0) return;
     if (!Configs::dataManager->settingsRepo->skip_delete_confirmation &&
-        QMessageBox::question(this, tr("Confirmation"), tr("Remove %1 item(s) ?").arg(removed_rows) + "\n" + remove_display) != QMessageBox::StandardButton::Yes) {
+        QMessageBox::question(this, tr("Confirmation"), tr("Remove %1 item(s) ?").arg(removed_rows) + "\n" + remove_display + HopReferenceWarning(del_ids)) != QMessageBox::StandardButton::Yes) {
+        return;
+    }
+    // Before the listing drops them, so a refused delete leaves no profile unlisted.
+    if (const auto refusal = Engine::ProfileService::CheckDelete(del_ids)) {
+        reportProfileDeleteRefusal(*refusal);
         return;
     }
 
     group->profiles = newOrder;
+    group->NormalizePins();
     Configs::dataManager->groupsRepo->Save(group);
-    if (!del_ids.isEmpty()) Configs::dataManager->profilesRepo->BatchDeleteProfiles(del_ids, true);
-    refresh_proxy_list({}, true, RefreshAnchor::Removal);
+    if (del_ids.isEmpty()) {
+        refresh_proxy_list({}, true, RefreshAnchor::Removal);
+    } else if (const auto refusal = Engine::ProfileService::Delete(del_ids, nullptr, {.stopRunning = true})) {
+        reportProfileDeleteRefusal(*refusal);
+    }
 }
 
 void MainWindow::on_menu_delete_triggered() {
     auto entIDs = get_now_selected_list();
     if (entIDs.count() == 0) return;
-    if (Configs::dataManager->settingsRepo->skip_delete_confirmation || QMessageBox::question(this, tr("Confirmation"), QString(tr("Remove %1 item(s) ?")).arg(entIDs.count()))==QMessageBox::StandardButton::Yes) {
-        Configs::dataManager->profilesRepo->BatchDeleteProfiles(entIDs, true);
-        refresh_proxy_list({}, true, RefreshAnchor::Removal);
+    if (Configs::dataManager->settingsRepo->skip_delete_confirmation || QMessageBox::question(this, tr("Confirmation"), QString(tr("Remove %1 item(s) ?")).arg(entIDs.count()) + HopReferenceWarning(entIDs))==QMessageBox::StandardButton::Yes) {
+        if (const auto refusal = Engine::ProfileService::Delete(entIDs, nullptr, {.stopRunning = true})) reportProfileDeleteRefusal(*refusal);
     }
 }
 
@@ -141,6 +191,7 @@ void MainWindow::on_menu_reset_traffic_triggered() {
         group->calculated_column_width.size() > ProfilesTableModel::ColTraffic)
         group->calculated_column_width[ProfilesTableModel::ColTraffic] = 0;
     refresh_proxy_list(entIDs);
+    Configs::RepositionLater(ents, Configs::SortInput::Traffic);
 }
 
 void MainWindow::on_menu_copy_links_triggered() {
@@ -177,36 +228,53 @@ void MainWindow::on_menu_export_config_triggered() {
     auto ents = get_now_selected_list();
     if (ents.count() != 1) return;
     auto ent = Configs::dataManager->profilesRepo->GetProfile(ents.first());
+    if (ent == nullptr) return;
 
-    auto result = Configs::BuildSingBoxConfig(ent);
-    QString config_core = QJsonObject2QString(result->coreConfig, true);
-    QApplication::clipboard()->setText(config_core);
-
-    QMessageBox msg(QMessageBox::Information, tr("Config copied"), config_core);
-    QPushButton *button_1 = msg.addButton(tr("Copy core config"), QMessageBox::YesRole);
-    QPushButton *button_2 = msg.addButton(tr("Copy test config"), QMessageBox::YesRole);
-    msg.addButton(QMessageBox::Ok);
-    msg.setEscapeButton(QMessageBox::Ok);
-    msg.setDefaultButton(QMessageBox::Ok);
-    msg.exec();
-    if (msg.clickedButton() == button_1) {
-        result = BuildSingBoxConfig(ent);
-        if (!result->error.isEmpty()) {
-            MessageBoxWarning("Build config error", result->error);
-            return;
-        }
-        config_core = QJsonObject2QString(result->coreConfig, true);
-        QApplication::clipboard()->setText(config_core);
-    } else if (msg.clickedButton() == button_2) {
-        auto res = Configs::BuildTestConfig({ent});
-        if (!res->error.isEmpty()) {
-            MessageBoxWarning("Build Test config error", res->error);
-            return;
-        }
-        if (!res->xrayFullConfigs.isEmpty()) config_core = res->xrayFullConfigs.first();
-        else config_core = QJsonObject2QString(res->coreConfig, true);
-        QApplication::clipboard()->setText(config_core);
+    // Display only, so no HOTP counter step; scoped tightly, as a real connect may run in the dialog's event loop.
+    const auto result = [&ent] {
+        const Configs::ScopedOtpSuppression otpSuppression;
+        return Configs::BuildSingBoxConfig(ent);
+    }();
+    if (!result->error.isEmpty()) {
+        MessageBoxWarning("Build config error", result->error);
+        return;
     }
+    // Taken from one build: the sing-box <-> Xray bridge ports and credentials are generated per build.
+    QStringList xrayConfigs = result->xrayFullConfigs;
+    if (!result->xrayConfig.isEmpty()) xrayConfigs.prepend(QJsonObject2QString(result->xrayConfig, false));
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Export Config"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *tabs = new QTabWidget(&dialog);
+    const auto addConfigTab = [tabs](const QString &name, const QString &config) {
+        auto *view = new JsonEdit::JsonCodeEdit(tabs);
+        view->setReadOnly(true);
+        view->setPlainText(config);
+        tabs->addTab(view, name);
+    };
+    addConfigTab("sing-box", QJsonObject2QString(result->coreConfig, false));
+    for (int i = 0; i < xrayConfigs.size(); i++) {
+        addConfigTab(xrayConfigs.size() == 1 ? QString("Xray") : QString("Xray %1").arg(i + 1), xrayConfigs[i]);
+    }
+    layout->addWidget(tabs, 1);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    const QString copyText = tr("Copy");
+    const QString copiedText = tr("Copied");
+    auto *copy = buttons->addButton(copyText, QDialogButtonBox::ActionRole);
+    buttons->button(QDialogButtonBox::Close)->setDefault(true);
+    layout->addWidget(buttons);
+
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(copy, &QPushButton::clicked, &dialog, [=] {
+        QApplication::clipboard()->setText(static_cast<QPlainTextEdit *>(tabs->currentWidget())->toPlainText());
+        copy->setText(copiedText);
+        QTimer::singleShot(1500, copy, [=] { copy->setText(copyText); });
+    });
+
+    dialog.resize(QSize(900, 600).boundedTo(dialog.screen()->availableGeometry().size()));
+    dialog.exec();
 }
 
 void MainWindow::display_qr_link(bool nkrFormat) {
@@ -265,7 +333,7 @@ void MainWindow::display_qr_link(bool nkrFormat) {
             l->setScaledContents(true);
             layout()->addWidget(l);
             cb = new QCheckBox;
-            cb->setText("Deep Link");
+            cb->setText(MainWindow::tr("Deep link"));
             // Set before wiring toggled, so refresh() below draws it just once.
             cb->setChecked(showDeep);
             layout()->addWidget(cb);
@@ -298,7 +366,7 @@ void MainWindow::parseQrImage(const QPixmap *image)
     } else {
         for (const QString &text : texts) {
             MW_show_log("QR Code Result:\n" + text);
-            import_text(text);
+            import_or_handle_deeplink(text);
         }
     }
 }
@@ -317,7 +385,7 @@ void MainWindow::on_menu_scan_qr_triggered() {
     }
     for (const QString &text : texts) {
         MW_show_log("QR Code Result:\n" + text);
-        import_text(text);
+        import_or_handle_deeplink(text);
     }
 }
 
@@ -326,21 +394,7 @@ void MainWindow::on_menu_clear_test_result_triggered() {
 }
 
 int MainWindow::clear_test_results(const QList<int> &profileIds) {
-    const auto ents = Configs::dataManager->profilesRepo->GetProfileBatch(profileIds);
-    if (ents.empty()) return 0;
-    QSet<int> gids;
-    for (const auto &ent: ents) {
-        ent->ClearTestResults();
-        gids.insert(ent->gid);
-    }
-    Configs::dataManager->profilesRepo->SaveBatch(ents);
-    for (const int gid : gids) {
-        if (auto group = Configs::dataManager->groupsRepo->GetGroup(gid); group &&
-            group->calculated_column_width.size() > ProfilesTableModel::ColTestResult)
-            group->calculated_column_width[ProfilesTableModel::ColTestResult] = 0;
-    }
-    refresh_proxy_list();
-    return static_cast<int>(ents.size());
+    return Engine::host()->clearTestResults(profileIds);
 }
 
 void MainWindow::on_menu_select_all_triggered() {
@@ -353,7 +407,7 @@ void MainWindow::on_menu_select_all_triggered() {
 
 void MainWindow::on_menu_update_subscription_triggered() {
     auto group = Configs::dataManager->groupsRepo->CurrentGroup();
-    if (group->url.isEmpty()) return;
+    if (group == nullptr || group->url.isEmpty()) return;
     if (mw_sub_updating) return;
     mw_sub_updating = true;
     Subscription::updater()->RefreshGroup(group->id, [&] { mw_sub_updating = false; }, true);
@@ -405,15 +459,14 @@ void MainWindow::on_menu_remove_invalid_triggered() {
 
      runOnUiThread([=,this]
      {
-         if (!out_del.empty() &&
-         (Configs::dataManager->settingsRepo->skip_delete_confirmation || QMessageBox::question(this, tr("Confirmation"), tr("Remove %1 Invalid item(s) ?").arg(out_del.length()) + "\n" + remove_display) == QMessageBox::StandardButton::Yes)) {
          QList<int> del_ids;
          for (const auto &ent: out_del) {
              del_ids += ent->id;
          }
-         Configs::dataManager->profilesRepo->BatchDeleteProfiles(del_ids, true);
-         refresh_proxy_list({}, true, RefreshAnchor::Removal);
-     }
+         if (!out_del.empty() &&
+             (Configs::dataManager->settingsRepo->skip_delete_confirmation || QMessageBox::question(this, tr("Confirmation"), tr("Remove %1 Invalid item(s) ?").arg(out_del.length()) + "\n" + remove_display + HopReferenceWarning(del_ids)) == QMessageBox::StandardButton::Yes)) {
+             if (const auto refusal = Engine::ProfileService::Delete(del_ids, nullptr, {.stopRunning = true})) reportProfileDeleteRefusal(*refusal);
+         }
      });
     });
 }
@@ -437,15 +490,69 @@ void MainWindow::on_menu_remove_insecure_triggered() {
     }
 
     if (del_ids.isEmpty()) {
-        QMessageBox::information(this, tr("Remove Insecure Configs"), tr("No insecure configs found."));
+        QMessageBox::information(this, tr("Remove insecure profiles"), tr("No insecure profiles found."));
         return;
     }
     if (Configs::dataManager->settingsRepo->skip_delete_confirmation ||
         QMessageBox::question(this, tr("Confirmation"),
-            tr("Remove %1 insecure config(s)?").arg(del_ids.length()) + "\n" + remove_display) == QMessageBox::StandardButton::Yes) {
-        Configs::dataManager->profilesRepo->BatchDeleteProfiles(del_ids, true);
-        refresh_proxy_list({}, true, RefreshAnchor::Removal);
+            tr("Remove %1 insecure profile(s)?").arg(del_ids.length()) + "\n" + remove_display + HopReferenceWarning(del_ids)) == QMessageBox::StandardButton::Yes) {
+        if (const auto refusal = Engine::ProfileService::Delete(del_ids, nullptr, {.stopRunning = true})) reportProfileDeleteRefusal(*refusal);
     }
+}
+
+void MainWindow::resolve_profile_domains(const QList<std::shared_ptr<Configs::Profile>> &profiles, const std::function<void()> &onFinished) {
+    QList<std::shared_ptr<Configs::Profile>> pending;
+    QStringList domains;
+    for (const auto &profile : profiles) {
+        if (profile == nullptr || profile->outbound == nullptr) continue;
+        const auto address = profile->outbound->GetAddress();
+        if (address.isEmpty() || IsIpAddress(address)) continue;
+        pending << profile;
+        domains << address;
+    }
+    domains.removeDuplicates();
+    if (pending.isEmpty()) {
+        onFinished();
+        return;
+    }
+    const auto probe = Configs::BuildTestConfig({});
+    if (!probe->error.isEmpty()) {
+        MW_show_log(tr("Failed to resolve domains: %1").arg(probe->error));
+        onFinished();
+        return;
+    }
+    const auto config = QJsonObject2QString(probe->coreConfig, false);
+
+    QPointer<MainWindow> self(this);
+    runOnNewThread([self, pending, domains, config, onFinished] {
+        bool rpcOK = false;
+        QString coreError;
+        const auto reply = API::defaultClient->ResolveDomains(&rpcOK, domains, config, &coreError);
+        runOnUiThread([self, pending, rpcOK, coreError, reply, onFinished] {
+            if (self == nullptr) return;
+            QHash<QString, QString> resolved;
+            if (!rpcOK) {
+                MW_show_log(tr("Failed to resolve domains: %1").arg(coreError.isEmpty() ? tr("the core did not answer") : coreError));
+            }
+            for (const auto &result : reply.results) {
+                const auto domain = QString::fromStdString(result.domain.value_or(""));
+                if (!result.addresses.empty()) {
+                    resolved.insert(domain, QString::fromStdString(result.addresses.front()));
+                } else {
+                    MW_show_log(tr("Failed to resolve %1: %2").arg(domain, QString::fromStdString(result.error.value_or(""))));
+                }
+            }
+            QList<std::shared_ptr<Configs::Profile>> changed;
+            for (const auto &profile : pending) {
+                const auto address = resolved.value(profile->outbound->GetAddress());
+                if (address.isEmpty()) continue;
+                profile->outbound->SetAddress(address);
+                changed << profile;
+            }
+            if (!changed.isEmpty()) Engine::ProfileService::Save(changed);
+            onFinished();
+        });
+    });
 }
 
 void MainWindow::on_menu_resolve_selected_triggered() {
@@ -454,17 +561,9 @@ void MainWindow::on_menu_resolve_selected_triggered() {
 
     if (mw_sub_updating) return;
     mw_sub_updating = true;
-    Configs::dataManager->settingsRepo->resolve_count = profiles.count();
 
     auto ents = Configs::dataManager->profilesRepo->GetProfileBatch(profiles);
-    for (const auto &profile: ents) {
-        profile->outbound->ResolveDomainToIP([=,this] {
-            Configs::dataManager->profilesRepo->Save(profile);
-            refresh_proxy_list({profile->id});
-            if (--Configs::dataManager->settingsRepo->resolve_count != 0) return;
-            mw_sub_updating = false;
-        });
-    }
+    resolve_profile_domains(ents, [] { mw_sub_updating = false; });
 }
 
 void MainWindow::on_menu_resolve_domain_triggered() {
@@ -481,21 +580,12 @@ void MainWindow::on_menu_resolve_domain_triggered() {
     }
     if (mw_sub_updating) return;
     mw_sub_updating = true;
-    Configs::dataManager->settingsRepo->resolve_count = profiles.count();
 
-    for (const auto id: profiles) {
-        auto profile = Configs::dataManager->profilesRepo->GetProfile(id);
-        profile->outbound->ResolveDomainToIP([=,this] {
-            Configs::dataManager->profilesRepo->Save(profile);
-            refresh_proxy_list({profile->id});
-            if (--Configs::dataManager->settingsRepo->resolve_count != 0) return;
-            mw_sub_updating = false;
-        });
-    }
+    resolve_profile_domains(Configs::dataManager->profilesRepo->GetProfileBatch(profiles), [] { mw_sub_updating = false; });
 }
 
 void MainWindow::on_profilesTableView_customContextMenuRequested(const QPoint &pos) {
-    ui->menu_server->popup(ui->profilesTableView->viewport()->mapToGlobal(pos));
+    showProfilesContextMenu(pos);
 }
 
 QList<int> MainWindow::get_now_selected_list() {
@@ -596,6 +686,10 @@ void MainWindow::focusProfilesTable(bool selectFirst) {
 }
 
 void MainWindow::clearUnavailableProfiles(bool confirm, QList<int> profileIDs) {
+    if (!confirm) {
+        Engine::ProfileService::RemoveUnavailable(std::move(profileIDs));
+        return;
+    }
     QList<int> del_ids;
     int remove_display_count = 0;
     QString remove_display;
@@ -615,14 +709,15 @@ void MainWindow::clearUnavailableProfiles(bool confirm, QList<int> profileIDs) {
         }
     }
 
-    auto clearFunc = [&, this] {
-        Configs::dataManager->profilesRepo->BatchDeleteProfiles(del_ids);
-        refresh_proxy_list({}, true, RefreshAnchor::Removal);
+    auto clearFunc = [&] {
+        // Never stops the running profile, which Delete would refuse.
+        del_ids.removeAll(Engine::Lifecycle::ResumeTargetId());
+        if (const auto refusal = Engine::ProfileService::Delete(del_ids)) reportProfileDeleteRefusal(*refusal);
     };
 
     if (!del_ids.isEmpty()) {
         if (confirm && !Configs::dataManager->settingsRepo->skip_delete_confirmation) {
-            if (QMessageBox::question(this, tr("Confirmation"), tr("Remove %1 Unavailable item(s) ?").arg(del_ids.length()) + "\n" + remove_display) == QMessageBox::StandardButton::Yes) {
+            if (QMessageBox::question(this, tr("Confirmation"), tr("Remove %1 Unavailable item(s) ?").arg(del_ids.length()) + "\n" + remove_display + HopReferenceWarning(del_ids)) == QMessageBox::StandardButton::Yes) {
                 clearFunc();
             }
         } else {

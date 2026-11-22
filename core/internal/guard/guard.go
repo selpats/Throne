@@ -31,6 +31,9 @@ const GID = 0x7448524F
 // EnvIdentity makes a root core adopt GID before it opens any socket.
 const EnvIdentity = "THRONE_GUARD"
 
+// IdentityExitCode is the core's exit code when ApplyIdentity fails; it must match Sys::KillSwitch::kCoreIdentityExitCode.
+const IdentityExitCode = 86
+
 const (
 	CodePrivilege   = "privilege"
 	CodeUnsupported = "unsupported"
@@ -46,6 +49,10 @@ type Config struct {
 	TunCIDRs   []string `json:"tun_cidrs"`
 	ExtraPaths []string `json:"extra_paths"`
 	BridgeName string   `json:"bridge_name"`
+	// APIPort is the Throne API's TCP port, 0 when it does not listen; replies on connections peers open to it pass.
+	APIPort uint16 `json:"api_port"`
+	// KeepStates skips macOS's global pf state flush; set only when replacing a READY guard whose anchor stays loaded meanwhile.
+	KeepStates bool `json:"keep_states"`
 }
 
 type config struct {
@@ -54,6 +61,8 @@ type config struct {
 	TunPrefixes []netip.Prefix
 	ExtraPaths  []string
 	BridgeName  string
+	APIPort     uint16
+	KeepStates  bool
 }
 
 // Event is a runtime report from a backend; a Fatal one makes the guard disarm and exit.
@@ -121,7 +130,7 @@ func parseConfig(line string) (*config, error) {
 	if len(raw.BridgeName) > 12 || !interfaceNamePattern.MatchString(raw.BridgeName) {
 		return nil, newError(CodeConfig, "invalid bridge name %q", raw.BridgeName)
 	}
-	cfg := &config{AllowLAN: raw.AllowLAN, TunName: raw.TunName, BridgeName: raw.BridgeName}
+	cfg := &config{AllowLAN: raw.AllowLAN, TunName: raw.TunName, BridgeName: raw.BridgeName, APIPort: raw.APIPort, KeepStates: raw.KeepStates}
 	for _, cidr := range raw.TunCIDRs {
 		if strings.TrimSpace(cidr) == "" {
 			continue
@@ -162,8 +171,23 @@ func (r *reporter) line(fields ...string) {
 	_, _ = fmt.Fprintln(os.Stdout, text)
 }
 
+var permittedExecutables []string
+
+// PermitExecutable makes the Windows guard pass an executable's traffic like its own: an elevated guard runs from the
+// grant's protected copy, while a core that fell back to running unelevated runs from the install.
+func PermitExecutable(path string) {
+	path = filepath.Clean(path)
+	for _, known := range permittedExecutables {
+		if strings.EqualFold(known, path) {
+			return
+		}
+	}
+	permittedExecutables = append(permittedExecutables, path)
+}
+
 // Run never returns. Stdout carries READY, ERROR <code> <message>, WARN <message> and FAIL <code> <message> lines.
-func Run(parentPID int) {
+// The guard disarms once its parent or any of alsoWatch exits.
+func Run(parentPID int, alsoWatch ...int) {
 	signal.Ignore(syscall.SIGPIPE)
 	log.SetOutput(os.Stderr)
 	out := &reporter{}
@@ -203,12 +227,17 @@ func Run(parentPID int) {
 	}
 	out.line("READY")
 
-	done := make(chan string, 4)
+	done := make(chan string, 4+len(alsoWatch))
 	go func() {
 		_, _ = io.Copy(io.Discard, reader)
 		done <- "stdin closed"
 	}()
 	go watchParent(parentPID, done)
+	for _, pid := range alsoWatch {
+		if pid > 1 {
+			go watchProcess(pid, fmt.Sprintf("process %d", pid), done)
+		}
+	}
 
 	for {
 		select {
@@ -259,13 +288,7 @@ func watchParent(parentPID int, done chan<- string) {
 		return
 	}
 	if runtime.GOOS == "windows" {
-		parent, err := os.FindProcess(parentPID)
-		if err != nil {
-			done <- "parent not found"
-			return
-		}
-		_, _ = parent.Wait()
-		done <- "parent exited"
+		watchProcess(parentPID, "parent", done)
 		return
 	}
 	for range time.Tick(time.Second) {
@@ -274,6 +297,24 @@ func watchParent(parentPID int, done chan<- string) {
 			return
 		}
 	}
+}
+
+func watchProcess(pid int, name string, done chan<- string) {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		done <- name + " not found"
+		return
+	}
+	if runtime.GOOS == "windows" {
+		_, _ = process.Wait()
+	} else {
+		for range time.Tick(time.Second) {
+			if process.Signal(syscall.Signal(0)) != nil {
+				break
+			}
+		}
+	}
+	done <- name + " exited"
 }
 
 // goSafe runs fn on its own goroutine; a panic there must disarm through Run, not kill the process with rules installed.

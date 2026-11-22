@@ -1,25 +1,28 @@
 #include "include/ui/group/dialog_edit_group.h"
 
-#include "include/ui/mainwindow_interface.h"
-
 #include <QClipboard>
 #include <QHash>
 #include <QStringListModel>
 #include <QCompleter>
 #include <QTimer>
 #include <QAbstractItemView>
+#include <QUrl>
 
 #include "include/database/GroupsRepo.h"
 #include "include/database/ProfilesRepo.h"
+#include "include/database/RoutesRepo.h"
+#include "include/engine/Lifecycle.h"
 #include "include/global/RunningProfiles.hpp"
+#include "include/global/Validation.hpp"
 #include "include/ui/group/dialog_edit_group_advanced.h"
+#include "include/ui/utils/ValidationForm.h"
 
 
 #define ADJUST_SIZE runOnThread([=,this] { adjustSize(); adjustPosition(mainwindow); }, this);
 
 namespace {
     bool editGroupRunningProfileInherits(const QList<int> &profileIds) {
-        const int startedId = Configs::dataManager->settingsRepo->started_id;
+        const int startedId = Engine::Lifecycle::ResumeTargetId();
         if (startedId < 0) return false;
         QList<int> running;
         for (const int id : profileIds) {
@@ -35,19 +38,39 @@ namespace {
 DialogEditGroup::DialogEditGroup(const std::shared_ptr<Configs::Group> &ent, QWidget *parent) : QDialog(parent), ui(new Ui::DialogEditGroup) {
     ui->setupUi(this);
     this->ent = ent;
+    if (ent->id >= 0) editLock.emplace(Engine::EditTarget::Group, ent->id);
+    form = new Validation::Form(this);
+    form->attachStatus(ui->buttonBox);
 
     connect(ui->type, &QComboBox::currentIndexChanged, this, [=,this](int index) {
         ui->cat_sub->setHidden(index == 0);
         ADJUST_SIZE
     });
+    form->bind(ui->url, [](const QString &text) {
+        // The fetcher's QNetworkAccessManager reads file:// URLs too, and those carry no host.
+        if (QUrl(text.trimmed()).isLocalFile()) return QString();
+        return Validation::Url(text, {QStringLiteral("http"), QStringLiteral("https"), QStringLiteral("file")}, Validation::Empty::Required);
+    }).when([this] { return ui->type->currentIndex() == 1; });
 
     ui->name->setText(ent->name);
     ui->auto_clear_unavailable->setChecked(ent->auto_clear_unavailable);
     ui->skip_auto_update->setChecked(ent->skip_auto_update);
+    ui->import_sub_route->setChecked(ent->import_sub_route);
+
+    const auto &routesRepo = Configs::dataManager->routesRepo;
+    const auto globalRoute = routesRepo->GetRouteProfile(Configs::dataManager->settingsRepo->current_route_id);
+    ui->route->addItem(globalRoute != nullptr ? tr("Default (%1)").arg(globalRoute->name) : tr("Default"), QVariant(-1));
+    for (const auto &route : routesRepo->GetAllRouteProfiles()) {
+        const bool owned = ent->id >= 0 && route->source_gid == ent->id;
+        ui->route->addItem(owned ? tr("%1 (from this subscription)").arg(route->name) : route->name, QVariant(route->id));
+    }
+    // A dangling id builds with the global routing profile, so it shows as Default.
+    ui->route->setCurrentIndex(std::max(0, ui->route->findData(QVariant(ent->route_id))));
     subOptions = ent->sub_options;
     endpoint = ent->endpoint;
     connect(ui->advanced, &QPushButton::clicked, this, [this] {
-        auto dialog = new DialogEditGroupAdvanced(subOptions, this->ent->sub_info.server_interval, endpoint, ui->type->currentIndex() == 1, this);
+        auto dialog = new DialogEditGroupAdvanced(subOptions, this->ent->sub_info.server_interval, endpoint, ui->type->currentIndex() == 1,
+                                                  static_cast<int>(this->ent->Profiles().size()), this);
         connect(dialog, &QDialog::accepted, this, [this, dialog] {
             subOptions = dialog->Options();
             endpoint = dialog->Endpoint();
@@ -59,16 +82,8 @@ DialogEditGroup::DialogEditGroup(const std::shared_ptr<Configs::Group> &ent, QWi
     ui->type->setCurrentIndex(ent->url.isEmpty() ? 0 : 1);
     ui->type->currentIndexChanged(ui->type->currentIndex());
     ui->cat_share->setVisible(false);
-    if (Configs::dataManager->profilesRepo->GetProfile(ent->front_proxy_id) == nullptr) {
-        ent->front_proxy_id = -1;
-        Configs::dataManager->groupsRepo->Save(ent);
-    }
-    if (Configs::dataManager->profilesRepo->GetProfile(ent->landing_proxy_id) == nullptr) {
-        ent->landing_proxy_id = -1;
-        Configs::dataManager->groupsRepo->Save(ent);
-    }
-    CACHE.front_proxy = ent->front_proxy_id;
-    LANDING.landing_proxy = ent->landing_proxy_id;
+    loadedFrontProxy = CACHE.front_proxy = ent->front_proxy_id;
+    loadedLandingProxy = LANDING.landing_proxy = ent->landing_proxy_id;
 
     if (ent->id >= 0) { // already a group
         ui->type->setDisabled(true);
@@ -100,14 +115,23 @@ DialogEditGroup::DialogEditGroup(const std::shared_ptr<Configs::Group> &ent, QWi
     QStringList proxyNameList;
     proxyNameToId.clear();
     proxyNameToId.insert("None", -1);
+    proxyNameToId.insert(tr("None"), -1);
     ui->front_proxy->setMaxCount(200);
     ui->landing_proxy->setMaxCount(200);
     ui->front_proxy->blockSignals(true);
     ui->landing_proxy->blockSignals(true);
     ui->front_proxy->setUpdatesEnabled(false);
     ui->landing_proxy->setUpdatesEnabled(false);
-    ui->front_proxy->addItem("None", QVariant(-1));
-    ui->landing_proxy->addItem("None", QVariant(-1));
+    ui->front_proxy->addItem(tr("None"), QVariant(-1));
+    ui->landing_proxy->addItem(tr("None"), QVariant(-1));
+    // Listed and selected, so OK keeps the stored id of a deleted profile unless another entry is picked.
+    const auto addMissingProfile = [this](QComboBox *combo, int id) {
+        if (id < 0 || Configs::dataManager->profilesRepo->GetProfile(id) != nullptr) return;
+        combo->addItem(get_proxy_name(id), QVariant(id));
+        combo->setCurrentIndex(combo->count() - 1);
+    };
+    addMissingProfile(ui->front_proxy, CACHE.front_proxy);
+    addMissingProfile(ui->landing_proxy, LANDING.landing_proxy);
     const int comboCap = ui->front_proxy->maxCount();
     int comboCount = 1; // "None" already added
     for (const auto&[id, name] : proxyList) {
@@ -186,11 +210,27 @@ DialogEditGroup::DialogEditGroup(const std::shared_ptr<Configs::Group> &ent, QWi
         LANDING.landing_proxy = ui->landing_proxy->itemData(index).value<int>();
     });
 
+    const auto proxyRule = [this](QComboBox *combo, const QString &loaded) {
+        return [this, combo, loaded](const QString &text) {
+            const QString trimmed = text.trimmed();
+            // An untouched name keeps the stored selection, which may sit outside the listed groups.
+            if (trimmed.isEmpty() || trimmed == "None" || trimmed == tr("None") || text == loaded) return QString();
+            for (const auto &name : {text, trimmed}) {
+                if (combo->findText(name, Qt::MatchExactly) >= 0 || proxyNameToId.contains(name)) return QString();
+            }
+            return tr("No profile named \"%1\". Pick one from the list.").arg(trimmed);
+        };
+    };
+    form->bind(ui->front_proxy, proxyRule(ui->front_proxy, ui->front_proxy->currentText())).raw();
+    form->bind(ui->landing_proxy, proxyRule(ui->landing_proxy, ui->landing_proxy->currentText())).raw();
+
     connect(ui->copy_links, &QPushButton::clicked, this, [=] {
         QStringList links;
         auto profiles = Configs::dataManager->profilesRepo->GetProfileBatch(ent->Profiles());
         for (const auto &profile: profiles) {
-            links += profile->outbound->ExportToLink();
+            auto link = profile->outbound->ExportToLink();
+            if (link.isEmpty()) link = profile->outbound->ExportJsonLink();
+            links += link;
         }
         QApplication::clipboard()->setText(links.join("\n"));
         MessageBoxInfo(software_name, tr("Copied"));
@@ -206,6 +246,7 @@ DialogEditGroup::DialogEditGroup(const std::shared_ptr<Configs::Group> &ent, QWi
     });
 
     ui->name->setFocus();
+    form->markAll();
 
     ADJUST_SIZE
 }
@@ -214,9 +255,14 @@ DialogEditGroup::~DialogEditGroup() {
     delete ui;
 }
 
+void DialogEditGroup::StartAsSubscription() {
+    ui->type->setCurrentIndex(1);
+    ui->url->setFocus();
+}
+
 int DialogEditGroup::resolve_proxy_selection(QComboBox *combo, int fallback) const {
     const QString text = combo->currentText().trimmed();
-    if (text.isEmpty() || text == "None") {
+    if (text.isEmpty() || text == "None" || text == tr("None")) {
         return -1;
     }
 
@@ -234,13 +280,9 @@ int DialogEditGroup::resolve_proxy_selection(QComboBox *combo, int fallback) con
 }
 
 void DialogEditGroup::accept() {
-    if (ent->id >= 0) { // already a group
-        if (!ent->url.isEmpty() && ui->url->text().isEmpty()) {
-            MessageBoxWarning(tr("Warning"), tr("Please input URL"));
-            return;
-        }
-    }
-    const QString newUrl = ui->url->text().trimmed();
+    if (!form->validateAll()) return;
+    // A basic group keeps no URL, even one typed before switching the type back.
+    const QString newUrl = ui->type->currentIndex() == 1 ? ui->url->text().trimmed() : QString();
     if (ent->url != newUrl) {
         ent->sub_info = Configs::SubUserInfo{};
         ent->sub_last_update = 0;
@@ -250,20 +292,32 @@ void DialogEditGroup::accept() {
     ent->auto_clear_unavailable = ui->auto_clear_unavailable->isChecked();
     ent->url = newUrl;
     ent->skip_auto_update = ui->skip_auto_update->isChecked();
+    refreshNeeded = ent->id >= 0 && !newUrl.isEmpty() && !ent->archive && !ent->sub_options.SameFilters(subOptions);
     ent->sub_options = subOptions;
     restartNeeded = endpoint != ent->endpoint && editGroupRunningProfileInherits(ent->Profiles());
     ent->endpoint = endpoint;
-    ent->front_proxy_id = resolve_proxy_selection(ui->front_proxy, CACHE.front_proxy);
-    ent->landing_proxy_id = resolve_proxy_selection(ui->landing_proxy, LANDING.landing_proxy);
+    const int routeId = ui->route->currentData().toInt();
+    if (const auto started = Configs::dataManager->profilesRepo->GetProfile(Engine::Lifecycle::ResumeTargetId());
+        ent->id >= 0 && started != nullptr && started->gid == ent->id && Configs::RunningRouteId() >= 0 &&
+        Configs::ResolveRouteId(routeId) != Configs::RunningRouteId()) {
+        restartNeeded = true;
+    }
+    ent->route_id = routeId;
+    ent->import_sub_route = !newUrl.isEmpty() && ui->import_sub_route->isChecked();
+    // Written only when changed from the loaded value: deleting the profile meanwhile cleared the live pointer, and OK must not restore it.
+    if (const int front = resolve_proxy_selection(ui->front_proxy, CACHE.front_proxy); front != loadedFrontProxy) ent->front_proxy_id = front;
+    if (const int landing = resolve_proxy_selection(ui->landing_proxy, LANDING.landing_proxy); landing != loadedLandingProxy) {
+        ent->landing_proxy_id = landing;
+    }
     QDialog::accept();
 }
 
 QString DialogEditGroup::get_proxy_name(int id) {
-    if (id == -1) return "None";
+    if (id == -1) return tr("None");
     if (auto profile = Configs::dataManager->profilesRepo->GetProfile(id)) {
         auto group = Configs::dataManager->groupsRepo->GetGroup(profile->gid);
-        if (group == nullptr) return "INVALID";
+        if (group == nullptr) return tr("INVALID");
         return QString("[" + group->name + "] ") + profile->name;
     }
-    return "INVALID";
+    return tr("Missing profile (#%1)").arg(id);
 }

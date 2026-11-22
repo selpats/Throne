@@ -3,7 +3,7 @@
 #include <QStringList>
 
 namespace Configs {
-    // started_id / remember_id when nothing is selected. Consumers test < 0.
+    // The resume target / remember_id when nothing is selected. Consumers test < 0.
     constexpr int NoProfileId = -1919;
 
     namespace DomainMatcher {
@@ -18,7 +18,7 @@ namespace Configs {
     }
 
     namespace SingboxOptions {
-        inline QStringList SniffProtocols = {"http", "tls", "quic", "stun", "dns", "bittorrent", "dtls", "ssh", "rdp"};
+        inline QStringList SniffProtocols = {"http", "tls", "quic", "stun", "dns", "bittorrent", "dtls", "ssh", "rdp", "ntp"};
         inline QStringList ActionTypes = {"route", "reject", "hijack-dns", "route-options", "sniff", "resolve"};
         inline QStringList rejectMethods = {"default", "drop", "reply"};
     }
@@ -43,7 +43,6 @@ namespace Configs {
             DL,
             UL,
             SIMPLEDL,
-            COUNTRY,
         };
     }
 

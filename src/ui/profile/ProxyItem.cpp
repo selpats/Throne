@@ -1,12 +1,23 @@
 #include "include/ui/profile/ProxyItem.h"
 
 #include <QMessageBox>
+#include <QStyle>
 
 #include "include/configs/generate.h"
+#include "include/ui/utils/ThemedIcon.hpp"
+
+void ProxyItem::setColorRole(QWidget *widget, const QString &role) {
+    if (widget->property("colorRole").toString() == role) return;
+    widget->setProperty("colorRole", role);
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+}
 
 ProxyItem::ProxyItem(QWidget *parent, const std::shared_ptr<Configs::Profile> &ent, QListWidgetItem *item)
     : QWidget(parent), ui(new Ui::ProxyItem) {
     ui->setupUi(this);
+    ui->change->setIcon(ThemedIcon(QStringLiteral("arrow-left-right")));
+    ui->remove->setIcon(ThemedIcon(QStringLiteral("trash")));
     this->setLayoutDirection(Qt::LeftToRight);
 
     this->item = item;
@@ -26,6 +37,8 @@ void ProxyItem::refresh_data() {
     ui->address->setText(Configs::DisplayEffectiveAddress(ent));
     ui->traffic->setText(ent->DisplayTraffic());
     ui->test_result->setText(ent->DisplayTestResult());
+    ui->test_result->setToolTip({});
+    setColorRole(ui->test_result, {});
 
     runOnThread(
         [=,this] {
@@ -34,6 +47,12 @@ void ProxyItem::refresh_data() {
             dynamic_cast<QWidget *>(parent())->adjustSize();
         },
         this);
+}
+
+void ProxyItem::showStepResult(const QString &text, const QString &toolTip, const QString &colorRole) {
+    ui->test_result->setText(text);
+    ui->test_result->setToolTip(toolTip);
+    setColorRole(ui->test_result, colorRole);
 }
 
 void ProxyItem::on_remove_clicked() {

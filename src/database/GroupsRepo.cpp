@@ -7,8 +7,9 @@
 #include <QSet>
 
 #include "include/database/ProfilesRepo.h"
+#include "include/engine/EngineEvents.h"
 #include "include/global/Configs.hpp"
-#include "include/ui/mainwindow.h"
+#include "include/global/Logger.hpp"
 
 
 namespace Configs {
@@ -39,6 +40,12 @@ namespace Configs {
                 sub_options_json TEXT NOT NULL DEFAULT '{}',
                 sub_metadata_json TEXT NOT NULL DEFAULT '{}',
                 endpoint_json TEXT NOT NULL DEFAULT '{}',
+                sort_method INTEGER NOT NULL DEFAULT 0,
+                sort_descending INTEGER NOT NULL DEFAULT 0,
+                route_id INTEGER NOT NULL DEFAULT -1,
+                import_sub_route INTEGER NOT NULL DEFAULT 0,
+                pinned_json TEXT NOT NULL DEFAULT '[]',
+                show_services INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             )
@@ -52,6 +59,18 @@ namespace Configs {
             db.exec("ALTER TABLE groups ADD COLUMN sub_metadata_json TEXT NOT NULL DEFAULT '{}'");
         if (!groupsColumnExists("endpoint_json"))
             db.exec("ALTER TABLE groups ADD COLUMN endpoint_json TEXT NOT NULL DEFAULT '{}'");
+        if (!groupsColumnExists("sort_method"))
+            db.exec("ALTER TABLE groups ADD COLUMN sort_method INTEGER NOT NULL DEFAULT 0");
+        if (!groupsColumnExists("sort_descending"))
+            db.exec("ALTER TABLE groups ADD COLUMN sort_descending INTEGER NOT NULL DEFAULT 0");
+        if (!groupsColumnExists("route_id"))
+            db.exec("ALTER TABLE groups ADD COLUMN route_id INTEGER NOT NULL DEFAULT -1");
+        if (!groupsColumnExists("import_sub_route"))
+            db.exec("ALTER TABLE groups ADD COLUMN import_sub_route INTEGER NOT NULL DEFAULT 0");
+        if (!groupsColumnExists("pinned_json"))
+            db.exec("ALTER TABLE groups ADD COLUMN pinned_json TEXT NOT NULL DEFAULT '[]'");
+        if (!groupsColumnExists("show_services"))
+            db.exec("ALTER TABLE groups ADD COLUMN show_services INTEGER NOT NULL DEFAULT 1");
 
         db.exec(R"(
             CREATE TABLE IF NOT EXISTS groups_order (
@@ -59,6 +78,38 @@ namespace Configs {
                 display_order INTEGER NOT NULL
             )
         )");
+
+        db.exec(R"(
+            CREATE TABLE IF NOT EXISTS sub_country_verdicts (
+                gid INTEGER NOT NULL PRIMARY KEY,
+                verdicts_json TEXT NOT NULL DEFAULT '{}'
+            )
+        )");
+    }
+
+    QHash<QByteArray, QString> GroupsRepo::CountryVerdicts(int gid) const {
+        QHash<QByteArray, QString> verdicts;
+        const auto query = db.query("SELECT verdicts_json FROM sub_country_verdicts WHERE gid = ?", gid);
+        if (!query || !query->executeStep()) return verdicts;
+        const auto json = QJsonDocument::fromJson(QByteArray(query->getColumn(0).getText())).object();
+        for (auto it = json.constBegin(); it != json.constEnd(); ++it) {
+            const auto key = QByteArray::fromBase64(it.key().toLatin1());
+            if (const auto country = it.value().toString(); !key.isEmpty() && !country.isEmpty()) verdicts.insert(key, country);
+        }
+        return verdicts;
+    }
+
+    void GroupsRepo::SetCountryVerdicts(int gid, const QHash<QByteArray, QString>& verdicts) const {
+        if (verdicts.isEmpty()) {
+            db.exec("DELETE FROM sub_country_verdicts WHERE gid = ?", gid);
+            return;
+        }
+        QJsonObject json;
+        for (auto it = verdicts.constBegin(); it != verdicts.constEnd(); ++it) json.insert(QString::fromLatin1(it.key().toBase64()), it.value());
+        db.exec(R"(
+            INSERT INTO sub_country_verdicts (gid, verdicts_json) VALUES (?, ?)
+            ON CONFLICT(gid) DO UPDATE SET verdicts_json = excluded.verdicts_json
+        )", gid, QJsonDocument(json).toJson(QJsonDocument::Compact).toStdString());
     }
 
     bool GroupsRepo::groupsColumnExists(const char* columnName) const {
@@ -86,13 +137,19 @@ namespace Configs {
         json["endpoint"] = group->endpoint.ToJson();
         json["front_proxy_id"] = group->front_proxy_id;
         json["landing_proxy_id"] = group->landing_proxy_id;
+        json["route_id"] = group->route_id;
+        json["import_sub_route"] = group->import_sub_route;
         json["column_width"] = QListInt2QJsonArray(group->column_width);
         json["profiles"] = QListInt2QJsonArray(group->profiles);
+        json["pinned"] = QListInt2QJsonArray(group->pinned);
         json["scroll_last_profile"] = group->scroll_last_profile;
         json["test_sort_by"] = static_cast<int>(group->test_sort_by);
         json["traffic_sort_by"] = static_cast<int>(group->traffic_sort_by);
         json["type_sort_by"] = static_cast<int>(group->type_sort_by);
+        json["sort_method"] = static_cast<int>(group->sort.method);
+        json["sort_descending"] = group->sort.descending;
         json["test_items_to_show"] = static_cast<int>(group->test_items_to_show);
+        json["show_services"] = group->show_services;
 
         return json;
     }
@@ -115,14 +172,22 @@ namespace Configs {
         group->endpoint = EndpointSource::FromJson(json["endpoint"].toObject());
         group->front_proxy_id = json["front_proxy_id"].toInt();
         group->landing_proxy_id = json["landing_proxy_id"].toInt();
+        group->route_id = json["route_id"].toInt(-1);
+        group->import_sub_route = json["import_sub_route"].toBool();
         group->column_width = QJsonArray2QListInt(json["column_width"].toArray());
         group->profiles = QJsonArray2QListInt(json["profiles"].toArray());
+        group->pinned = QJsonArray2QListInt(json["pinned"].toArray());
         group->scroll_last_profile = json["scroll_last_profile"].toInt(-1);
         group->test_sort_by = static_cast<testBy>(json["test_sort_by"].toInt(0));
         group->traffic_sort_by = static_cast<trafficBy>(json["traffic_sort_by"].toInt(0));
         group->type_sort_by = static_cast<typeBy>(json["type_sort_by"].toInt(0));
+        if (const int method = json["sort_method"].toInt(0); method > 0 && method <= GroupSortMethod::ByLatency) {
+            group->sort.method = static_cast<GroupSortMethod::GroupSortMethod>(method);
+            group->sort.descending = json["sort_descending"].toBool();
+        }
         group->test_items_to_show = static_cast<testShowItems>(json["test_items_to_show"].toInt(0));
-        
+        group->show_services = json["show_services"].toBool(true);
+
         return group;
     }
 
@@ -138,14 +203,16 @@ namespace Configs {
         QString subOptionsJson = QString::fromUtf8(QJsonDocument(group->sub_options.ToJson()).toJson(QJsonDocument::Compact));
         QString subMetadataJson = QString::fromUtf8(QJsonDocument(group->sub_info.toJson()).toJson(QJsonDocument::Compact));
         QString endpointJson = QString::fromUtf8(QJsonDocument(group->endpoint.ToJson()).toJson(QJsonDocument::Compact));
+        QString pinnedJson = QString::fromUtf8(QJsonDocument(QListInt2QJsonArray(group->pinned)).toJson(QJsonDocument::Compact));
 
         db.exec(R"(
             INSERT INTO groups
             (id, archive, skip_auto_update, auto_clear_unavailable, name, url, info, sub_last_update,
              front_proxy_id, landing_proxy_id,
              column_width_json, profiles_json, scroll_last_profile, test_sort_by, traffic_sort_by, test_items_to_show,
-             type_sort_by, sub_options_json, sub_metadata_json, endpoint_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             type_sort_by, sub_options_json, sub_metadata_json, endpoint_json, sort_method, sort_descending,
+             route_id, import_sub_route, pinned_json, show_services)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 archive = excluded.archive, skip_auto_update = excluded.skip_auto_update,
                 auto_clear_unavailable = excluded.auto_clear_unavailable, name = excluded.name,
@@ -156,6 +223,9 @@ namespace Configs {
                 traffic_sort_by = excluded.traffic_sort_by, test_items_to_show = excluded.test_items_to_show,
                 type_sort_by = excluded.type_sort_by, sub_options_json = excluded.sub_options_json,
                 sub_metadata_json = excluded.sub_metadata_json, endpoint_json = excluded.endpoint_json,
+                sort_method = excluded.sort_method, sort_descending = excluded.sort_descending,
+                route_id = excluded.route_id, import_sub_route = excluded.import_sub_route,
+                pinned_json = excluded.pinned_json, show_services = excluded.show_services,
                 updated_at = strftime('%s', 'now')
         )",
             id,
@@ -177,7 +247,13 @@ namespace Configs {
             static_cast<int>(group->type_sort_by),
             subOptionsJson.toStdString(),
             subMetadataJson.toStdString(),
-            endpointJson.toStdString()
+            endpointJson.toStdString(),
+            static_cast<int>(group->sort.method),
+            group->sort.descending ? 1 : 0,
+            group->route_id,
+            group->import_sub_route ? 1 : 0,
+            pinnedJson.toStdString(),
+            group->show_services ? 1 : 0
         );
     }
 
@@ -186,7 +262,8 @@ namespace Configs {
             SELECT id, archive, skip_auto_update, auto_clear_unavailable, name, url, info, sub_last_update,
                    front_proxy_id, landing_proxy_id,
                    column_width_json, profiles_json, scroll_last_profile, test_sort_by, traffic_sort_by, test_items_to_show,
-                   type_sort_by, sub_options_json, sub_metadata_json, endpoint_json
+                   type_sort_by, sub_options_json, sub_metadata_json, endpoint_json, sort_method, sort_descending,
+                   route_id, import_sub_route, pinned_json, show_services
             FROM groups WHERE id = ?
         )", id);
         if (!query || !query->executeStep()) {
@@ -238,6 +315,15 @@ namespace Configs {
             endpointDoc.isObject()) {
             json["endpoint"] = endpointDoc.object();
         }
+        json["sort_method"] = query->getColumn(20).getInt();
+        json["sort_descending"] = query->getColumn(21).getInt() != 0;
+        json["route_id"] = query->getColumn(22).getInt();
+        json["import_sub_route"] = query->getColumn(23).getInt() != 0;
+        if (const auto pinnedDoc = QJsonDocument::fromJson(QByteArray(query->getColumn(24).getText()));
+            pinnedDoc.isArray()) {
+            json["pinned"] = pinnedDoc.array();
+        }
+        json["show_services"] = query->getColumn(25).getInt() != 0;
 
         auto group = groupFromJson(json);
         // Refreshes could map several identical servers onto one id, leaving it in the persisted list once per server (#1775).
@@ -249,11 +335,12 @@ namespace Configs {
             seen.insert(pid);
             unique.append(pid);
         }
-        if (unique.size() != group->profiles.size()) {
-            group->profiles = std::move(unique);
-            // The caller (GetGroup) already holds the mutex, so write straight through.
-            saveToDatabase(group.get(), group->id);
-        }
+        bool repaired = unique.size() != group->profiles.size();
+        if (repaired) group->profiles = std::move(unique);
+        // A save between a wholesale rewrite of the order and its NormalizePins leaves the pins apart from the head.
+        if (group->NormalizePins()) repaired = true;
+        // The caller (GetGroup) already holds the mutex, so write straight through.
+        if (repaired) saveToDatabase(group.get(), group->id);
         return group;
     }
 
@@ -277,6 +364,7 @@ namespace Configs {
             group->id,
             maxOrder + 1
         );
+        ++revision;
         return true;
     }
 
@@ -301,11 +389,34 @@ namespace Configs {
         return GetGroup(currentGroupId);
     }
 
-    void GroupsRepo::DeleteGroup(int id) {
-        QMutexLocker locker(&mutex);
-        memMap.erase(id);
-        db.exec("DELETE FROM groups_order WHERE group_id = ?", id);
-        db.exec("DELETE FROM groups WHERE id = ?", id);
+    bool GroupsRepo::DeleteGroup(int id) {
+        const auto group = GetGroup(id);
+        const QList<int> listed = group != nullptr ? group->Profiles() : QList<int>{};
+        QSet<int> profileIds(listed.cbegin(), listed.cend());
+        // Runs under ProfilesRepo's lock, so no profile Save lands between the delete and the tombstones.
+        const bool deleted = dataManager->profilesRepo->DeleteAndForget([&](QList<int>& deletedIds) {
+            QMutexLocker locker(&mutex);
+            const bool ok = db.transaction("GroupsRepo::DeleteGroup", [&] {
+                {
+                    const auto owned = db.queryThrow("SELECT id FROM profiles WHERE gid = ?", id);
+                    while (owned->executeStep()) profileIds.insert(owned->getColumn(0).getInt());
+                }
+                db.execThrow("DELETE FROM groups_order WHERE group_id = ?", id);
+                db.execDeleteByIdInThrow("profiles", "id", std::vector<int>(profileIds.cbegin(), profileIds.cend()));
+                db.execThrow("DELETE FROM sub_country_verdicts WHERE gid = ?", id);
+                db.execThrow("DELETE FROM groups WHERE id = ?", id);
+                return true;
+            });
+            if (!ok) return false;
+            memMap.erase(id);
+            // Only an id that existed: ids past the counter are still to be handed out.
+            if (group != nullptr) tombstones.insert(id);
+            deletedIds = profileIds.values();
+            ++revision;
+            return true;
+        });
+        if (deleted) ClearHopReferences(profileIds);
+        return deleted;
     }
 
     QList<int> GroupsRepo::GetAllGroupIds() const {
@@ -341,16 +452,18 @@ namespace Configs {
     }
 
     void GroupsRepo::SetGroupsTabOrder(const QList<int>& order) {
+        QMutexLocker locker(&mutex);
         db.exec("DELETE FROM groups_order");
-        if (!order.isEmpty()) {
-            std::vector<int> pairs;
-            pairs.reserve(order.size() * 2);
-            for (int i = 0; i < order.size(); ++i) {
-                pairs.push_back(order[i]);
-                pairs.push_back(i);
-            }
-            db.execBatchInsertIntPairs("groups_order", "group_id", "display_order", pairs);
+        std::vector<int> pairs;
+        pairs.reserve(order.size() * 2);
+        int position = 0;
+        for (const int id : order) {
+            if (tombstones.contains(id)) continue;
+            pairs.push_back(id);
+            pairs.push_back(position++);
         }
+        if (!pairs.empty()) db.execBatchInsertIntPairs("groups_order", "group_id", "display_order", pairs);
+        ++revision;
     }
 
     bool GroupsRepo::Save(const std::shared_ptr<Group>& group) {
@@ -362,10 +475,115 @@ namespace Configs {
             return false;
         }
         
-        QMutexLocker locker(&mutex);
-        saveToDatabase(group.get(), group->id);
-        memMap[group->id] = group;
-        
-        return true;
+        {
+            QMutexLocker locker(&mutex);
+            if (!tombstones.contains(group->id)) {
+                saveToDatabase(group.get(), group->id);
+                memMap[group->id] = group;
+                ++revision;
+                return true;
+            }
+        }
+        LOG_DEBUG(QString("Group %1 was deleted; not saving it").arg(group->id));
+        return false;
+    }
+
+    QList<HopReference> GroupsRepo::HopReferences(const QSet<int>& profileIds, int exceptGroup) const {
+        QList<HopReference> refs;
+        if (profileIds.isEmpty()) return refs;
+        for (const int gid : GetAllGroupIds()) {
+            if (gid == exceptGroup) continue;
+            const auto group = GetGroup(gid);
+            if (group == nullptr) continue;
+            if (profileIds.contains(group->front_proxy_id)) refs.append({gid, group->name, HopRole::Front, group->front_proxy_id});
+            if (profileIds.contains(group->landing_proxy_id)) refs.append({gid, group->name, HopRole::Landing, group->landing_proxy_id});
+        }
+        return refs;
+    }
+
+    QList<HopReference> GroupsRepo::ClearHopReferences(const QSet<int>& deletedProfileIds) {
+        QList<HopReference> cleared;
+        for (const auto& ref : HopReferences(deletedProfileIds)) {
+            const auto group = GetGroup(ref.groupId);
+            if (group == nullptr) continue;
+            int& proxyId = ref.role == HopRole::Front ? group->front_proxy_id : group->landing_proxy_id;
+            if (proxyId != ref.profileId) continue;
+            proxyId = -1;
+            if (!Save(group)) continue;
+            MW_show_log(ref.role == HopRole::Front
+                            ? QStringLiteral("[Groups] %1: front proxy removed (its profile was deleted)").arg(ref.groupName)
+                            : QStringLiteral("[Groups] %1: landing proxy removed (its profile was deleted)").arg(ref.groupName));
+            cleared << ref;
+        }
+        return cleared;
+    }
+
+    namespace {
+        struct PendingSort {
+            QSet<int> changed;
+            bool full = false;
+        };
+
+        QMutex sortQueueMutex;
+        QHash<int, PendingSort> pendingSorts;
+        bool sortWorkerRunning = false;
+
+        void drainSorts() {
+            for (;;) {
+                QHash<int, PendingSort> batch;
+                {
+                    QMutexLocker locker(&sortQueueMutex);
+                    if (pendingSorts.isEmpty()) {
+                        sortWorkerRunning = false;
+                        return;
+                    }
+                    batch.swap(pendingSorts);
+                }
+                QList<int> moved;
+                for (auto it = batch.cbegin(); it != batch.cend(); ++it) {
+                    const auto group = dataManager->groupsRepo->GetGroup(it.key());
+                    if (group == nullptr) continue;
+                    const bool reordered = it->full ? group->Resort() : group->Reposition(it->changed.values());
+                    if (!reordered) continue;
+                    dataManager->groupsRepo->Save(group);
+                    moved << it.key();
+                }
+                if (!moved.isEmpty()) Engine::EngineEvents::GroupOrderChanged(moved);
+            }
+        }
+
+        // Requests landing while a sort runs merge into one job per group.
+        void enqueueSort(int gid, SortInput input, const QList<int> &changed, bool full) {
+            if (!dataManager || !dataManager->groupsRepo) return;
+            const auto group = dataManager->groupsRepo->GetGroup(gid);
+            if (group == nullptr || !group->SortReads(input)) return;
+            QMutexLocker locker(&sortQueueMutex);
+            auto &pending = pendingSorts[gid];
+            pending.full = pending.full || full;
+            if (!pending.full) {
+                for (int id : changed) pending.changed.insert(id);
+            }
+            if (sortWorkerRunning) return;
+            sortWorkerRunning = true;
+            runOnNewThread(drainSorts);
+        }
+    }
+
+    void ResortLater(int gid) {
+        enqueueSort(gid, SortInput::Membership, {}, true);
+    }
+
+    void RepositionLater(const QHash<int, QList<int>>& changedByGroup, SortInput input) {
+        for (auto it = changedByGroup.cbegin(); it != changedByGroup.cend(); ++it) {
+            enqueueSort(it.key(), input, it.value(), false);
+        }
+    }
+
+    void RepositionLater(const QList<std::shared_ptr<Profile>>& profiles, SortInput input) {
+        QHash<int, QList<int>> changedByGroup;
+        for (const auto& profile : profiles) {
+            if (profile != nullptr) changedByGroup[profile->gid] << profile->id;
+        }
+        RepositionLater(changedByGroup, input);
     }
 }

@@ -1,12 +1,105 @@
 #pragma once
 #include "include/configs/baseConfig.h"
+#include "include/configs/common/ResolverSource.h"
+#include "include/global/Validation.hpp"
 
 namespace Configs {
-    inline QStringList XrayNetworks = {"raw", "xhttp", "ws", "httpupgrade", "grpc"};
+    inline QStringList XrayNetworks = {"raw", "xhttp", "ws", "httpupgrade", "grpc", "kcp", "xdrive"};
+    // Xray still takes "Google Drive" for google-drive; ParseFromJson folds it.
+    inline QStringList XrayXDriveServices = {"google-drive", "s3", "template", "local"};
     inline QStringList XrayXHTTPModes = {"auto", "packet-up", "stream-up", "stream-one"};
     inline QStringList XrayXHTTPMetaPlacements = {"", "path", "cookie", "header", "query"};
     inline QStringList XrayXHTTPUplinkDataPlacements = {"", "auto", "body", "cookie", "header"};
     inline QStringList XrayXHTTPUplinkMethods = {"", "POST", "PUT", "PATCH", "GET"};
+
+    // Folds the aliases Xray itself accepts (tcp, splithttp, websocket, mkcp), case-insensitively, onto the XrayNetworks names.
+    QString NormalizeXrayNetwork(const QString& network);
+
+    // Rewrites the finalmask spellings Xray now refuses or ignores (key case, old mask names, old xdns shapes); true when anything changed.
+    bool UpgradeXrayFinalmask(QJsonObject& finalmask);
+
+    // Removes masterKeyLog from the TLS settings of the finalmask's xdns resolvers; true when any went.
+    bool StripXrayFinalmaskKeyLog(QJsonObject& finalmask, const QString& at, Validation::Issues& issues);
+
+    bool XrayFinalmaskHasXdns(const QJsonObject& finalmask);
+
+    // Go's strings.ToLower, for comparing against ASCII names: Qt lowercases U+0130 to two characters, Go to 'i'.
+    QString XrayLower(const QString& text);
+
+    // The spellings Go merges into the one XHTTP download leg Xray dials for an outbound (the object holding streamSettings), in decode order.
+    QList<QJsonObject> XrayDownloadLeg(const QJsonObject& outbound);
+
+    enum class XrayLegProtection { Verified, Unverified, Plain };
+    // How Xray protects a download leg made of these spellings, and the server it dials.
+    XrayLegProtection XrayDownloadLegProtection(const QList<QJsonObject>& leg, QString& server);
+
+    // Routes every leg of an Xray outbound through the outbound tagged tag, the XHTTP download leg included.
+    void SetXrayDialerProxy(QJsonObject& outbound, const QString& tag);
+
+    // Binds the XHTTP download leg of an Xray outbound to iface unless it names an interface of its own.
+    void BindXrayDownloadLeg(QJsonObject& outbound, const QString& iface);
+
+    // Removes dialerProxy and domainStrategy from every sockopt spelling of a stream object; true when any went.
+    bool StripXrayDialerState(QJsonObject& stream);
+
+    // Turns on useSystemCA in every TLS block of an Xray outbound, the XHTTP download leg included, unless the block sets it itself.
+    void UseXraySystemCA(QJsonObject& outbound);
+
+    // Rules the Xray stream editor and the import check share; each returns an empty string when acceptable.
+    namespace Checks {
+        QString XrayNetwork(const QString& network);
+        QString XraySecurity(const QString& security);
+        QString XrayRealityNetwork(const QString& security, const QString& network);
+        QString XrayFingerprint(const QString& fingerprint, bool reality);
+        // Warnings: Xray skips unknown names, and a uTLS hello ignores the list.
+        QString XrayCipherSuites(const QString& text);
+        QString XrayCipherSuitesNeedUnsafe(const QString& cipherSuites, const QString& fingerprint);
+        QString XrayPinnedSha256(const QString& text);
+        // A warning: a bad list makes every connection fail. serverName is the effective SNI.
+        QString XrayEchConfigList(const QString& text, const QString& serverName);
+        QString XraySpiderX(const QString& spiderX);
+        QString XrayMldsa65Verify(const QString& key);
+        QString XrayHeadersHost(const QStringList& pairs);
+
+        // Xray Int32Range: "n" or "a-b" (negatives allowed, reversed bounds swapped).
+        QString XrayInt32Range(const QString& text);
+        QString XrayXPaddingBytes(const QString& text);
+        QString XrayXHTTPMode(const QString& mode);
+        QString XrayPaddingMethod(const QString& method);
+        QString XrayPaddingPlacement(const QString& placement);
+        QString XrayMetaPlacement(const QString& placement);
+        QString XrayUplinkDataPlacement(const QString& placement, const QString& mode);
+        QString XrayUplinkMethod(const QString& method, const QString& mode);
+        QString XraySessionId(const QString& table, const QString& length);
+        QString XrayXmuxExclusive(const QString& maxConnections, const QString& maxConcurrency);
+        // Errors for an outbound's XHTTP download leg that would crash the core: no address, no port 1-65535, or another network.
+        void XrayXHTTPDownloadLeg(Validation::Issues& issues, const QString& at, const QJsonObject& outbound);
+
+        QString XrayXDriveService(const QString& service);
+        QString XrayXDriveFolder(const QString& service, const QString& folder);
+        // google-drive takes exactly ClientID, ClientSecret and RefreshToken; s3 AccessKeyID, SecretAccessKey and an optional SessionToken.
+        QString XrayXDriveSecrets(const QString& service, const QStringList& secrets);
+        QString XrayXDriveTemplate(const QString& service, const QJsonObject& templateSpec);
+        QString XrayXDriveS3Endpoint(const QString& service, const QString& endpoint);
+        QString XrayXDriveS3Region(const QString& service, const QString& region);
+        // Virtual-hosted addressing puts the bucket in the endpoint's host name, which a bare IP or a non-DNS name cannot carry.
+        QString XrayXDriveS3Bucket(const QString& service, const QString& bucket, const QString& endpoint, bool pathStyle);
+        // A tuning value: Xray reads a uint32, and 0 keeps its default.
+        QString XrayXDriveTuning(const QString& text);
+        QString XrayXDriveFrontPort(const QString& port);
+        // A warning: the front port is dialed only together with a front address.
+        QString XrayXDriveFrontPortAlone(const QString& address, const QString& port);
+
+        // mKCP values, which Xray reads as uint32; an empty text keeps Xray's default.
+        QString XrayKCPMtu(const QString& text);
+        QString XrayKCPTti(const QString& text);
+        QString XrayKCPCapacity(const QString& text);
+        QString XrayKCPCwndMultiplier(const QString& text);
+        // Xray sends at most maxSendingWindow / MTU packets ahead and refuses a window that holds none; an empty MTU is Xray's 1350.
+        QString XrayKCPMaxSendingWindow(const QString& text, const QString& mtu);
+        // Errors and warnings for the xdns masks of a finalmask; at is "" or ends in '.'. resolversReplaced: a resolver source stands in for theirs.
+        void XrayFinalmask(Validation::Issues& issues, const QString& at, const QJsonObject& finalmask, bool resolversReplaced = false);
+    }
 
     // dns-direct answers every outbound server domain, so its "disable IPv6" caps this.
     QString getDirectDomainStrategy();
@@ -21,8 +114,12 @@ namespace Configs {
         QString verifyPeerCertByName;
         QStringList alpn;
         QString fingerprint;
+        // Colon separated, as Xray takes it.
+        QString cipherSuites;
         // Base64 ECHConfigList, or "<query domain>+<DoH url>" for Xray to fetch it itself.
         QString echConfigList;
+        // Only stored; the global xray_use_system_ca also turns it on at build time.
+        bool useSystemCA = false;
 
         bool ParseFromLink(const QString& link) override;
         bool ParseFromJson(const QJsonObject& object) override;
@@ -39,6 +136,8 @@ namespace Configs {
         QString password;
         QString shortId;
         QString spiderX;
+        // The server's ML-DSA-65 public key ("pqv" in links), which signs the REALITY certificate.
+        QString mldsa65Verify;
 
         bool ParseFromLink(const QString& link) override;
         bool ParseFromJson(const QJsonObject& object) override;
@@ -76,9 +175,9 @@ namespace Configs {
         bool noSSEHeader = false;
         QString scMaxEachPostBytes;
         QString scMinPostsIntervalMs;
-        long long scMaxBufferedPosts;
+        long long scMaxBufferedPosts = 0;
         QString scStreamUpServerSecs;
-        int serverMaxHeaderBytes;
+        int serverMaxHeaderBytes = 0;
         // extra/xmux
         QJsonObject rawXmux;
         QString maxConcurrency;
@@ -144,6 +243,67 @@ namespace Configs {
         BuildResult Build() override;
     };
 
+    // XDRIVE has no share-link format: a link would carry the storage secrets, so profiles travel as JSON.
+    class xrayXDrive : public baseConfig {
+    public:
+        QString service = "google-drive";
+        QString remoteFolder;
+        // google-drive: ClientID, ClientSecret, RefreshToken; s3: AccessKeyID, SecretAccessKey[, SessionToken];
+        // template: read as {secret0}, {secret1}, ...
+        QStringList secrets;
+        QJsonObject templateSpec;
+        // s3 only; Xray addresses the bucket path-style unless pathStyle is false.
+        QString s3Endpoint;
+        QString s3Region;
+        QString s3Bucket;
+        bool s3PathStyle = true;
+        // The stream's own address and port: a front the storage API is dialed through.
+        QString frontAddress;
+        int frontPort = 0;
+        // 0 keeps Xray's default.
+        qint64 segmentBytes = 0;
+        qint64 flushIntervalMs = 0;
+        qint64 pollIntervalMs = 0;
+        qint64 maxPollIntervalMs = 0;
+        qint64 sessionTtlSeconds = 0;
+        qint64 concurrency = 0;
+        qint64 eagerWindowMs = 0;
+        qint64 holeTimeoutMs = 0;
+        // Kept as written; the editor has no fields for it.
+        QJsonObject xmux;
+
+        bool ParseFromLink(const QString& link) override;
+        bool ParseFromJson(const QJsonObject& object) override;
+        bool ParseFromClash(const clash::Proxies& object) override;
+        QString ExportToLink() override;
+        QJsonObject ExportToJson() override;
+        BuildResult Build() override;
+    };
+
+    // mKCP; its old header and seed live in finalmask as mkcp-legacy masks.
+    class xrayKCP : public baseConfig {
+    public:
+        static constexpr qint64 DefaultMtu = 1350;
+        static constexpr qint64 DefaultTti = 50;
+        static constexpr qint64 DefaultUplinkCapacity = 5;
+        static constexpr qint64 DefaultDownlinkCapacity = 20;
+        static constexpr qint64 DefaultCwndMultiplier = 1;
+        static constexpr qint64 DefaultMaxSendingWindow = 2097152;
+
+        qint64 mtu = DefaultMtu;
+        qint64 tti = DefaultTti;
+        qint64 uplinkCapacity = DefaultUplinkCapacity;
+        qint64 downlinkCapacity = DefaultDownlinkCapacity;
+        qint64 cwndMultiplier = DefaultCwndMultiplier;
+        qint64 maxSendingWindow = DefaultMaxSendingWindow;
+
+        bool ParseFromLink(const QString& link) override;
+        bool ParseFromJson(const QJsonObject& object) override;
+        QString ExportToLink() override;
+        QJsonObject ExportToJson() override;
+        BuildResult Build() override;
+    };
+
     class xrayStreamSetting : public baseConfig {
         public:
         QString network = "raw";
@@ -157,6 +317,10 @@ namespace Configs {
         std::shared_ptr<xrayWS> ws = std::make_shared<xrayWS>();
         std::shared_ptr<xrayHttpUpgrade> httpupgrade = std::make_shared<xrayHttpUpgrade>();
         std::shared_ptr<xrayGRPC> grpc = std::make_shared<xrayGRPC>();
+        std::shared_ptr<xrayXDrive> xdrive = std::make_shared<xrayXDrive>();
+        std::shared_ptr<xrayKCP> kcp = std::make_shared<xrayKCP>();
+        // XDNS only; stored under Throne-only keys that Build() removes.
+        ResolverSource xdnsResolvers;
 
         bool ParseFromLink(const QString& link) override;
         bool ParseFromJson(const QJsonObject& object) override;
@@ -165,5 +329,11 @@ namespace Configs {
         QJsonObject ExportToJson() override;
         QJsonObject ExportIdentity() override;
         BuildResult Build() override;
+        BuildResult Build(const QString& owner);
+
+        // XDNS is network "kcp" with an "xdns" mask in finalmask.udp; imports and the editor store exactly these spellings.
+        [[nodiscard]] bool IsXdns() const;
+
+        void Validate(Validation::Issues& issues, const QString& serverAddress);
     };
 }

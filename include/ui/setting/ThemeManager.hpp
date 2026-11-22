@@ -3,6 +3,11 @@
 #include <QObject>
 #include <QPalette>
 #include <QColor>
+#include <QHash>
+#include <QIcon>
+#include <QStyle>
+
+#include <array>
 
 // UI colours resolved from the installed palette, then contrast-repaired against `surface`.
 // Use these rather than palette(...) in a QSS: stylesheet palette() resolves against
@@ -14,8 +19,16 @@ struct ThemeTokens {
     QColor muted;
     QColor tag;
     QColor danger;
+    QColor warning;
     QColor success;
     QColor info;
+    std::array<QColor, 5> chartSeries;
+    QColor chartContext;
+    // Custom themes only; invalid under a Qt style, which keeps the Link-coloured running row.
+    QColor runningRow;
+    QColor onRunningRow;
+    QColor runningMark;
+    QColor onRunningMark;
 };
 
 class ThemeManager : public QObject {
@@ -27,8 +40,21 @@ public:
     ThemeTokens tokens;          // rebuilt by every ApplyTheme(), before themeChanged fires
 
     void ApplyTheme(const QString &theme, bool force = false);
+
+    // QStyle::standardIcon loads from the system on every call: about 9 ms for a message box icon on Windows.
+    QIcon standardIcon(QStyle::StandardPixmap pixmap);
 signals:
     void themeChanged(QString themeName);
+
+private:
+    QHash<int, QIcon> standardIcons; // the current style's; ApplyTheme() reloads the message box icons
+    bool applying = false;
 };
 
 ThemeManager *themeManager();
+
+// Walks color's HSL lightness away from surface until their contrast ratio reaches ratio; hue and saturation stay.
+QColor ContrastSeparated(const QColor &color, const QColor &surface, double ratio);
+
+// The calm colour the toolbar icons wear: hue at low saturation, kept 3:1 off surface.
+QColor MutedTint(int hue, const QColor &surface);

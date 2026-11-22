@@ -1,6 +1,6 @@
 #include "include/ui/stats/dialog_auto_selector.h"
 
-#include "include/global/GuiUtils.hpp"
+#include "include/ui/utils/GuiUtils.hpp"
 
 #include <QCheckBox>
 #include <QDateTime>
@@ -20,12 +20,13 @@ namespace
 {
     enum Column {
         ColRank = 0,
+        ColTier,
         ColName,
         ColState,
         ColLatency,
-        ColJitter,
         ColChecks,
         ColDials,
+        ColTraffic,
         ColLastOK,
         ColNote,
         ColCount
@@ -48,6 +49,7 @@ namespace
         if (member.state == "untested") return QObject::tr("Not checked");
         if (member.state == "dead") return QObject::tr("Failing");
         if (member.state == "cooldown") return QObject::tr("Paused");
+        if (member.state == "suspect") return QObject::tr("Suspect");
         return member.state;
     }
 
@@ -56,8 +58,21 @@ namespace
         if (member.state == "ok") return 0;
         if (member.state == "degraded") return 1;
         if (member.state == "untested") return 2;
-        if (member.state == "cooldown") return 3;
-        return 4; // dead
+        if (member.state == "suspect") return 3;
+        if (member.state == "cooldown") return 4;
+        return 5; // dead
+    }
+
+    QString realTrafficTip(const Stats::AutoSelectorMemberView &member)
+    {
+        const auto firstReply = member.firstByteMs > 0
+                                    ? QObject::tr("Time to the first reply: %1 ms on average.")
+                                          .arg(member.firstByteMs)
+                                    : QObject::tr("Time to the first reply: none yet.");
+        const auto recent = QObject::tr("Recently %1 answered and %2 failed.")
+                                .arg(member.recentAnswered)
+                                .arg(member.recentFailed);
+        return firstReply + QLatin1Char('\n') + recent;
     }
 
     struct Key {
@@ -66,7 +81,6 @@ namespace
     };
 
     Key latencyKey(const Stats::AutoSelectorMemberView &m) { return {m.samples > 0 && m.averageMs > 0, static_cast<double>(m.averageMs)}; }
-    Key jitterKey(const Stats::AutoSelectorMemberView &m) { return {m.samples > 0, static_cast<double>(m.deviationMs)}; }
 
     Key checksKey(const Stats::AutoSelectorMemberView &m)
     {
@@ -82,13 +96,43 @@ namespace
 
     Key lastOKKey(const Stats::AutoSelectorMemberView &m) { return {m.lastOKms > 0, static_cast<double>(m.lastOKms)}; }
 
-    QString noteText(const Stats::AutoSelectorMemberView &member)
+    struct FailbackContext {
+        // -1 unless the priority strategy chose the member in use; a pin holds it whatever the tiers say.
+        int selectedPriority = -1;
+        int checks = 0;
+        qint64 delayMs = 0;
+    };
+
+    FailbackContext failbackContext(const Stats::AutoSelectorView &view)
+    {
+        FailbackContext context;
+        if (!view.prioritized() || (!view.pinnedTag.isEmpty() && view.pinnedTag == view.selectedTag)) return context;
+        context.selectedPriority = view.selectedPriority();
+        context.checks = view.failbackChecks;
+        context.delayMs = view.failbackDelayMs;
+        return context;
+    }
+
+    QString noteText(const Stats::AutoSelectorMemberView &member, const FailbackContext &failback)
     {
         if (member.pinned) {
             if (member.selected) return QObject::tr("your choice, carrying traffic now");
             return QObject::tr("your choice, but not usable right now");
         }
         if (member.selected) return QObject::tr("carrying traffic now");
+        if (member.priority < failback.selectedPriority && member.isUsable()) {
+            if (member.streak < failback.checks) {
+                return QObject::tr("recovering — %1 of %2 checks passed").arg(member.streak).arg(failback.checks);
+            }
+            const auto remainingMs = member.lastFailureMs + failback.delayMs - QDateTime::currentMSecsSinceEpoch();
+            if (remainingMs > 0) return QObject::tr("recovering — moving back in %1s").arg((remainingMs + 999) / 1000);
+            return QObject::tr("recovering");
+        }
+        if (member.isSuspect()) {
+            const auto remainingMs = member.suspectUntilMs - QDateTime::currentMSecsSinceEpoch();
+            if (remainingMs > 0) return QObject::tr("real connections failing — retried in %1s").arg((remainingMs + 999) / 1000);
+            return QObject::tr("real connections failing — retried soon");
+        }
         if (member.state == "cooldown") {
             const auto secs = (member.cooldownUntilMs - QDateTime::currentMSecsSinceEpoch()) / 1000;
             if (secs > 0) return QObject::tr("failed to connect, retrying in %1s").arg(secs);
@@ -130,11 +174,7 @@ DialogAutoSelector::DialogAutoSelector(QWidget *parent) : QDialog(parent)
     controls->addStretch();
 
     m_pin = new QPushButton(tr("Use this profile"), this);
-    m_pin->setToolTip(tr("Keep the selected profile in use instead of letting the ranking choose. "
-                         "Useful when several profiles measure much the same and you prefer one of "
-                         "them.\n\nIt stays a preference, not a lock: if that profile stops working "
-                         "the selector still moves on, and comes back to your choice once it "
-                         "recovers."));
+    m_pin->setToolTip(tr("Prefer the selected profile over the ranking while it works."));
     connect(m_pin, &QPushButton::clicked, this, [this] { applySelection(highlightedTag()); });
     controls->addWidget(m_pin);
 
@@ -144,8 +184,7 @@ DialogAutoSelector::DialogAutoSelector(QWidget *parent) : QDialog(parent)
     controls->addWidget(m_release);
 
     m_recheck = new QPushButton(tr("Check all now"), this);
-    m_recheck->setToolTip(tr("Re-measure every running profile immediately instead of waiting for the "
-                             "next scheduled check."));
+    m_recheck->setToolTip(tr("Re-measure every running profile now."));
     connect(m_recheck, &QPushButton::clicked, this, [this] {
         Stats::autoSelectorMonitor->RequestRecheck();
         m_footer->setText(tr("Re-checking every profile..."));
@@ -155,8 +194,10 @@ DialogAutoSelector::DialogAutoSelector(QWidget *parent) : QDialog(parent)
 
     m_table = new QTableWidget(this);
     m_table->setColumnCount(ColCount);
-    m_table->setHorizontalHeaderLabels({"#", tr("Profile"), tr("Status"), tr("Latency"), tr("Jitter"),
-                                        tr("Checks"), tr("Connects"), tr("Last OK"), tr("Notes")});
+    m_table->setHorizontalHeaderLabels({"#", tr("Tier"), tr("Profile"), tr("Status"), tr("Latency"),
+                                        tr("Checks"), tr("Connects"), tr("Real traffic"), tr("Last OK"), tr("Notes")});
+    m_table->setColumnHidden(ColTier, true);
+    m_table->setColumnHidden(ColTraffic, true);
     m_table->verticalHeader()->setVisible(false);
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -255,6 +296,18 @@ void DialogAutoSelector::refresh()
             if (secs > 0) footer << tr("Next in %1s.").arg(secs);
         }
     }
+    if (const int tier = view.selectedPriority(); view.prioritized() && tier >= 0) {
+        footer << tr("Using tier %1: %2.").arg(QString::number(tier + 1), view.tierLabel(tier));
+        if (failbackContext(view).selectedPriority > 0) {
+            footer << tr("It moves back up once a profile from a higher tier passes %1 checks in a row and goes %2 s "
+                         "without a failure.")
+                          .arg(view.failbackChecks)
+                          .arg(view.failbackDelayMs / 1000);
+        }
+    }
+    if (view.passive) {
+        footer << tr("Learning from real connections: %n site(s) remember a profile.", nullptr, view.sitesRemembered);
+    }
     if (!view.pinnedTag.isEmpty()) {
         const auto pinnedName = view.pinnedName.isEmpty() ? view.pinnedTag : view.pinnedName;
         footer << (view.pinnedTag == view.selectedTag
@@ -272,13 +325,16 @@ void DialogAutoSelector::refresh()
     }
     m_footer->setText(footer.join(" "));
 
+    if (m_table->isColumnHidden(ColTier) == view.prioritized()) m_table->setColumnHidden(ColTier, !view.prioritized());
+    if (m_table->isColumnHidden(ColTraffic) == view.passive) m_table->setColumnHidden(ColTraffic, !view.passive);
     buildRows(view);
 }
 
-void DialogAutoSelector::sortRows(QList<Stats::AutoSelectorMemberView> &rows) const
+void DialogAutoSelector::sortRows(QList<Stats::AutoSelectorMemberView> &rows, const Stats::AutoSelectorView &view) const
 {
     const bool ascending = m_sortOrder == Qt::AscendingOrder;
     const int column = m_sortColumn;
+    const auto failback = failbackContext(view);
 
     const auto compareKeys = [ascending](const Key &left, const Key &right, bool &decided) {
         decided = true;
@@ -293,6 +349,9 @@ void DialogAutoSelector::sortRows(QList<Stats::AutoSelectorMemberView> &rows) co
         bool decided = false;
         bool result = false;
         switch (column) {
+            case ColTier:
+                if (a.priority != b.priority) return ascending ? a.priority < b.priority : a.priority > b.priority;
+                break;
             case ColName: {
                 const int cmp = QString::compare(a.name.isEmpty() ? a.tag : a.name,
                                                  b.name.isEmpty() ? b.tag : b.name, Qt::CaseInsensitive);
@@ -304,12 +363,17 @@ void DialogAutoSelector::sortRows(QList<Stats::AutoSelectorMemberView> &rows) co
                     return ascending ? stateOrder(a) < stateOrder(b) : stateOrder(a) > stateOrder(b);
                 break;
             case ColLatency: result = compareKeys(latencyKey(a), latencyKey(b), decided); break;
-            case ColJitter: result = compareKeys(jitterKey(a), jitterKey(b), decided); break;
             case ColChecks: result = compareKeys(checksKey(a), checksKey(b), decided); break;
             case ColDials: result = compareKeys(dialsKey(a), dialsKey(b), decided); break;
+            case ColTraffic:
+                if (a.recentFailed != b.recentFailed)
+                    return ascending ? a.recentFailed < b.recentFailed : a.recentFailed > b.recentFailed;
+                if (a.passiveFailed != b.passiveFailed)
+                    return ascending ? a.passiveFailed < b.passiveFailed : a.passiveFailed > b.passiveFailed;
+                break;
             case ColLastOK: result = compareKeys(lastOKKey(a), lastOKKey(b), decided); break;
             case ColNote: {
-                const int cmp = QString::compare(noteText(a), noteText(b), Qt::CaseInsensitive);
+                const int cmp = QString::compare(noteText(a, failback), noteText(b, failback), Qt::CaseInsensitive);
                 if (cmp != 0) return ascending ? cmp < 0 : cmp > 0;
                 break;
             }
@@ -345,7 +409,8 @@ void DialogAutoSelector::buildRows(const Stats::AutoSelectorView &view)
         if (filtered && !member.hasProblem()) continue;
         rows << member;
     }
-    sortRows(rows);
+    sortRows(rows, view);
+    const auto failback = failbackContext(view);
 
     // A full reset on every poll would fight the user's scroll position.
     if (m_table->rowCount() != rows.size()) m_table->setRowCount(static_cast<int>(rows.size()));
@@ -357,19 +422,17 @@ void DialogAutoSelector::buildRows(const Stats::AutoSelectorView &view)
             m_table->setItem(row, column, item);
         }
         if (item->text() != text) item->setText(text);
-        if (!tip.isEmpty()) item->setToolTip(tip);
+        if (item->toolTip() != tip) item->setToolTip(tip);
     };
 
     for (int row = 0; row < rows.size(); row++) {
         const auto &member = rows[row];
         setCell(row, ColRank, QString::number(member.rank));
+        setCell(row, ColTier, QString::number(member.priority + 1), view.tierLabel(member.priority));
         setCell(row, ColName, member.name.isEmpty() ? member.tag : member.name, member.tag);
         setCell(row, ColState, stateText(member));
         setCell(row, ColLatency, member.averageMs > 0 ? tr("%1 ms").arg(member.averageMs) : QStringLiteral("-"),
-                member.samples > 0 ? tr("Best %1 ms, worst %2 ms").arg(member.minMs).arg(member.maxMs) : QString());
-        setCell(row, ColJitter, member.samples > 0 ? tr("%1 ms").arg(member.deviationMs) : QStringLiteral("-"),
-                tr("How much the latency moves around. The selector prefers steady profiles over "
-                   "fast but erratic ones."));
+                member.minMs > 0 ? tr("Best %1 ms, worst %2 ms").arg(member.minMs).arg(member.maxMs) : QString());
         setCell(row, ColChecks,
                 member.samples > 0 ? tr("%1 / %2 ok").arg(member.samples - member.failures).arg(member.samples)
                                    : QStringLiteral("-"));
@@ -377,8 +440,13 @@ void DialogAutoSelector::buildRows(const Stats::AutoSelectorView &view)
                 member.dialTotal > 0 ? tr("%1 / %2 ok").arg(member.dialTotal - member.dialFail).arg(member.dialTotal)
                                      : QStringLiteral("-"),
                 tr("Real connection attempts made by apps through this profile."));
+        setCell(row, ColTraffic,
+                member.passiveAnswered > 0 || member.passiveFailed > 0
+                    ? tr("%1 ok / %2 failed").arg(member.passiveAnswered).arg(member.passiveFailed)
+                    : QString(),
+                realTrafficTip(member));
         setCell(row, ColLastOK, agoText(member.lastOKms));
-        setCell(row, ColNote, noteText(member));
+        setCell(row, ColNote, noteText(member, failback));
 
         auto *nameItem = m_table->item(row, ColName);
         nameItem->setData(Qt::UserRole, member.tag);

@@ -17,6 +17,17 @@
 #include "include/configs/sub/RouteUpdater.hpp"
 #include "include/database/GroupsRepo.h"
 #include "include/database/RoutesRepo.h"
+#include "include/database/SettingsSchema.h"
+#include "include/engine/EditLocks.h"
+#include "include/engine/EngineEvents.h"
+#include "include/engine/EngineHost.h"
+#include "include/engine/ThreadCheck.h"
+#include "include/engine/app/ExitController.h"
+#include "include/engine/connection/ConnectionManager.h"
+#include "include/engine/services/GroupService.h"
+#include "include/engine/services/ImportService.h"
+#include "include/engine/services/RouteService.h"
+#include "include/global/Logger.hpp"
 #include "include/global/PeriodicRunner.hpp"
 #include "include/sys/AutoRun.hpp"
 #include "include/sys/KillSwitch.hpp"
@@ -47,6 +58,21 @@ bool decodeImportedText(const QByteArray &bytes, QString &out) {
 
     out = QString::fromUtf8(bytes);
     return true;
+}
+
+// The updater files a gid -1 import under the current group, as ProfilesRepo::AddProfile does a route import's endpoints.
+bool importTargetAccepted(const QString &title = software_name) {
+    const auto refusal = Engine::ImportService::CheckTarget(Configs::dataManager->settingsRepo->current_group);
+    if (refusal) MessageBoxWarning(title, ImportTargetRefusalText(*refusal));
+    return !refusal;
+}
+
+// Main thread; route is the copy a worker fetched the remote rules into.
+void commitRemoteRouteUpdate(const std::shared_ptr<Configs::RouteProfile> &route) {
+    QString error;
+    if (Engine::IsBeingEdited(Engine::EditTarget::Routes, route->id)) error = QObject::tr("the routing profiles are open for editing");
+    else if (const auto refusal = Engine::RouteService::Save(route)) error = refusal->message;
+    if (!error.isEmpty()) MW_show_log(QObject::tr("Remote routing profile %1 failed: %2").arg(route->remoteURL, error));
 }
 
 } // namespace
@@ -106,11 +132,13 @@ void MainWindow::importFromFiles(const QStringList &paths)
     for (const QString &payload : payloads) {
         if (payload.startsWith("http://") || payload.startsWith("https://")) {
             import_text(payload);
+        } else if (payload.startsWith("throne://") && !payload.contains('\n')) {
+            import_or_handle_deeplink(payload);
         } else {
             batch << payload;
         }
     }
-    if (!batch.isEmpty()) Subscription::updater()->ImportBatch(batch);
+    if (!batch.isEmpty() && importTargetAccepted()) Subscription::updater()->ImportBatch(batch);
 
     if (payloads.isEmpty() && !problems.isEmpty()) {
         MessageBoxWarning(software_name, tr("Nothing could be imported:") + "\n" + problems.join("\n"));
@@ -155,28 +183,41 @@ void MainWindow::handle_deeplink_impl(const QString &url) {
         return;
     }
 
-    MW_show_log(tr("Ignored deeplink with unknown command: %1").arg(cmd));
+    MW_show_log(tr("Ignored deep link with unknown command: %1").arg(cmd));
 }
 
 void MainWindow::handle_import_route(const QString &url) {
     QString fatal, warnings;
     bool wasOldArray = false;
-    auto profile = Configs::RouteProfile::FromShareInput(url, &fatal, &warnings, &wasOldArray);
+    int newEndpoints = 0;
+    auto profile = Configs::RouteProfile::FromShareInput(url, &fatal, &warnings, &wasOldArray, false, &newEndpoints);
     if (!profile) {
         MessageBoxWarning(tr("Import routing profile"), tr("The link could not be parsed:\n") + fatal);
         return;
     }
-    if (profile->name.trimmed().isEmpty()) profile->name = tr("Imported profile");
+    const auto name = profile->name.trimmed().isEmpty() ? tr("Imported profile") : profile->name;
 
     ActivateWindow(this);
+    if (newEndpoints > 0 && !importTargetAccepted(tr("Import routing profile"))) return;
 
-    auto prompt = tr("Add this routing profile?\n\nName: %1").arg(profile->name);
-    if (!warnings.isEmpty()) prompt += "\n\n" + tr("Note:") + "\n" + warnings.trimmed();
-    if (QMessageBox::question(GetMessageBoxParent(), tr("Import routing profile"), prompt) != QMessageBox::StandardButton::Yes) {
-        return;
+    auto prompt = tr("Add this routing profile?\n\nName: %1").arg(name);
+    if (newEndpoints > 0) {
+        const auto group = Configs::dataManager->groupsRepo->CurrentGroup();
+        prompt += "\n\n" + tr("Its endpoints will be added as %n new profile(s) to the group \"%1\".", nullptr, newEndpoints)
+                               .arg(group != nullptr ? group->name : QString());
     }
+    if (!warnings.isEmpty()) prompt += "\n\n" + tr("Note:") + "\n" + warnings.trimmed();
+    QMessageBox box(QMessageBox::Question, tr("Import routing profile"), prompt, QMessageBox::Yes | QMessageBox::No, GetMessageBoxParent());
+    // The name and the notes come from the link: AutoText would render a tag-like one as HTML.
+    box.setTextFormat(Qt::PlainText);
+    if (box.exec() != QMessageBox::Yes) return;
 
-    Configs::dataManager->routesRepo->AddRouteProfile(profile);
+    if (newEndpoints > 0) profile = Configs::RouteProfile::FromShareInput(url, &fatal, &warnings, &wasOldArray);
+    if (profile == nullptr) return;
+    profile->name = name;
+    if (const auto error = Engine::RouteService::Add(profile)) MW_show_log(error->message);
+    // FromShareInput adds the endpoint profiles to the current group itself, so no ProfilesChanged refreshes the list.
+    if (newEndpoints > 0) refresh_proxy_list({}, true);
 }
 
 void MainWindow::handle_add_remote_routes(const QString &url) {
@@ -202,22 +243,31 @@ void MainWindow::handle_add_remote_routes(const QString &url) {
         return;
     }
 
+    QList<std::shared_ptr<Configs::RouteProfile>> updates;
     for (auto &profile : profiles) {
         profile->autoUpdate = autoUpdate;
-        Configs::dataManager->routesRepo->AddRouteProfile(profile);
+        if (const auto error = Engine::RouteService::Add(profile)) {
+            MW_show_log(QObject::tr("Remote routing profile %1 failed: %2").arg(profile->remoteURL, error->message));
+            continue;
+        }
+        // The added profile is live, so the worker fetches into a copy.
+        updates << std::make_shared<Configs::RouteProfile>(*profile);
     }
+    if (updates.isEmpty()) return;
 
-    const auto added = profiles;
-    runOnNewThread([added] {
+    runOnNewThread([updates] {
         int ok = 0;
-        for (const auto &p : added) {
+        for (const auto &p : updates) {
             QString warnings;
             const QString err = RouteUpdate::UpdateProfile(p, &warnings);
-            Configs::dataManager->routesRepo->Save(p);
-            if (err.isEmpty()) ok++;
-            else MW_show_log(QObject::tr("Remote routing profile %1 failed: %2").arg(p->remoteURL, err));
+            if (err.isEmpty()) {
+                ok++;
+                runOnUiThread([p] { commitRemoteRouteUpdate(p); });
+            } else {
+                MW_show_log(QObject::tr("Remote routing profile %1 failed: %2").arg(p->remoteURL, err));
+            }
         }
-        MW_show_log(QObject::tr("Added remote routing profiles: %1 of %2 fetched").arg(ok).arg(added.size()));
+        MW_show_log(QObject::tr("Added remote routing profiles: %1 of %2 fetched").arg(ok).arg(updates.size()));
     });
 }
 
@@ -241,9 +291,12 @@ void MainWindow::handle_addsub(const QString &url, const QString &name) {
     group->name = groupName;
     group->url = url;
     group->skip_auto_update = !autoUpdate;
-    Configs::dataManager->groupsRepo->AddGroup(group);
-    refresh_groups();
-    Subscription::updater()->RefreshGroup(group->id);
+    if (const auto error = Engine::GroupService::Add(group)) {
+        MW_show_log(error->message);
+        return;
+    }
+    Engine::EngineEvents::SubscriptionNewGroup(group->id);
+    Subscription::updater()->RefreshGroup(group->id, nullptr, Subscription::GroupUpdater::Surface::Report);
 }
 
 void MainWindow::import_or_handle_deeplink(const QString &text) {
@@ -263,12 +316,12 @@ void MainWindow::import_text(const QString &text) {
             QObject::tr("Import HTTP proxy profile"),
         };
         bool ok = false;
-        const auto choice = QInputDialog::getItem(nullptr, QObject::tr("url detected"),
+        const auto choice = QInputDialog::getItem(nullptr, QObject::tr("URL detected"),
                                                   QObject::tr("%1\nHow to update?").arg(content), items, 0, false, &ok);
         if (!ok) return;
         switch (items.indexOf(choice)) {
             case 0:
-                Subscription::updater()->ImportUrl(content);
+                if (importTargetAccepted()) Subscription::updater()->ImportUrl(content);
                 return;
             case 1:
                 Subscription::updater()->SubscribeUrl(content);
@@ -277,130 +330,58 @@ void MainWindow::import_text(const QString &text) {
                 break;
         }
     }
-    Subscription::updater()->ImportText(content);
+    if (importTargetAccepted()) Subscription::updater()->ImportText(content);
 }
 
-void MainWindow::dialog_message_impl(MwMessage cmd, const QStringList &args) {
-    const auto changed = [&](const QString &flag) { return args.contains(flag); };
-    auto &settings = Configs::dataManager->settingsRepo;
-
-    switch (cmd) {
-    case MwMessage::UpdateSettings: {
-        updateLogFilterFields();
+void MainWindow::applySettingsUi(quint32 effects) {
+    namespace Schema = Configs::SettingsSchema;
+    const auto has = [effects](quint32 bit) { return (effects & bit) != 0; };
+    const auto &settings = Configs::dataManager->settingsRepo;
+    if (has(Schema::UiLogFilter)) updateLogFilterFields();
+    if (has(Schema::UiTrafficStats)) {
         ui->actionTraffic_Stats->setVisible(!settings->disable_traffic_aggregation);
-        if (changed(MwArg::TrayIcon)) {
-            Icon::InvalidateTrayIconCache();
-            icon_status.reset();
-        }
-        if (changed(MwArg::MaxLogLines)) {
-            trimLogLines();
-            rebuildLogView();
-        }
-        if (changed(MwArg::LogFont)) {
-            applyLogBrowserFont();
-        }
-        if (changed(MwArg::DisableTray)) {
-            tray->setVisible(!settings->disable_tray);
-        }
-        if (changed(MwArg::ChoosePort)) {
-            settings->inbound_socks_port = MkPort(settings->inbound_address);
-            if (settings->spmode_system_proxy) {
-                set_spmode_system_proxy(false);
-                set_spmode_system_proxy(true);
+        refresh_traffic_graph_settings();
+    }
+    if (has(Schema::UiTrayIcon)) {
+        Icon::InvalidateTrayIconCache();
+        icon_status.reset();
+    }
+    if (has(Schema::UiLogLines)) {
+        trimLogLines();
+        rebuildLogView();
+    }
+    if (has(Schema::UiLogFont)) applyLogBrowserFont();
+    if (has(Schema::UiTray)) tray->setVisible(!settings->disable_tray);
+    if (has(Schema::UiProfileList)) {
+        if (auto group = Configs::dataManager->groupsRepo->CurrentGroup();
+            group && group->calculated_column_width.size() > ProfilesTableModel::ColType)
+            group->calculated_column_width[ProfilesTableModel::ColType] = 0;
+        // Both settings feed the security a Type sort reads.
+        for (const int gid : Configs::dataManager->groupsRepo->GetAllGroupIds()) {
+            const auto group = Configs::dataManager->groupsRepo->GetGroup(gid);
+            if (group != nullptr && ProfilesTableModel::columnOfSort(group->sort.method) == ProfilesTableModel::ColType) {
+                Configs::ResortLater(gid);
             }
         }
-        if (changed(MwArg::DisableAdmin)) {
-            AutoRun_FixTaskIfNeeded();
-        }
-        if (changed(MwArg::ProfileListDisplay)) {
-            if (auto group = Configs::dataManager->groupsRepo->CurrentGroup();
-                group && group->calculated_column_width.size() > ProfilesTableModel::ColType)
-                group->calculated_column_width[ProfilesTableModel::ColType] = 0;
-            refresh_proxy_list({}, true);
-        }
-        auto suggestRestartProxy = settings->Save();
-        Throne::PeriodicRunner::instance()->CheckNow();
-        if (changed(MwArg::KillSwitch) || changed(MwArg::Vpn)) Sys::KillSwitch::instance()->apply();
-        if (changed(MwArg::RemoteApi)) RemoteApi::Server::instance()->apply(RemoteApi::ConfigFromSettings());
-        if (changed(MwArg::Route)) {
-            settings->Save();
-            suggestRestartProxy = true;
-        }
-        if (changed(MwArg::NeedRestart)) {
-            suggestRestartProxy = false;
-        }
-        if (changed(MwArg::Vpn) && settings->spmode_vpn) {
-            MessageBoxWarning(tr("Tun Settings changed"), tr("Restart Tun to take effect."));
-        }
-        if (changed(MwArg::ChoosePort) || suggestRestartProxy) {
-            noteRestartNeeded(changed(MwArg::Route) ? tr("Routing") : tr("Settings"));
-        }
-        refresh_status();
-        if (changed(MwArg::NeedRestart) &&
-            QMessageBox::warning(GetMessageBoxParent(), tr("Settings changed"), tr("Restart the program to take effect."), QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
-            this->exit_reason = ExitReason::Restart;
-            on_menu_exit_triggered();
-        }
-        break;
+        refresh_proxy_list({}, true);
     }
+    if (has(Schema::UiShortcuts)) loadShortcuts();
+}
+
+void MainWindow::refreshTrayIcon() {
+    Icon::InvalidateTrayIconCache();
+    icon_status.reset();
+    refresh_status();
+}
+
+void MainWindow::dialog_message_impl(MwMessage cmd, const QStringList &) {
+    ENGINE_CHECK_MAIN_THREAD();
+    switch (cmd) {
     case MwMessage::RestartProgram:
-        this->exit_reason = ExitReason::Restart;
-        on_menu_exit_triggered();
+        exitController()->requestExit(ExitReason::Restart, false);
         break;
     case MwMessage::Raise:
         ActivateWindow(this);
-        break;
-    case MwMessage::UpdateShortcuts:
-        loadShortcuts();
-        break;
-    case MwMessage::ProfileChanged:
-        refresh_proxy_list({}, true);
-        if (changed(MwArg::RestartProxy)) noteRestartNeeded(tr("Profile"));
-        break;
-    case MwMessage::GroupsChanged:
-        refresh_groups();
-        profilesTableModel->invalidateAddresses();
-        if (changed(MwArg::RestartProxy)) noteRestartNeeded(tr("Group"));
-        break;
-    case MwMessage::SubscriptionFinished:
-        refresh_proxy_list({}, true);
-        if (!changed(MwArg::Quiet)) {
-            MW_show_log(tr("Imported %1 profile(s)").arg(settings->imported_count));
-        }
-        break;
-    case MwMessage::SubscriptionNewGroup:
-        refresh_groups();
-        break;
-    case MwMessage::SubscriptionGroupChanged: {
-        QList<int> disturbed;
-        for (int i = 1; i < args.size(); i++) disturbed << args[i].toInt();
-        on_subscription_group_changed(args.value(0).toInt(), disturbed);
-        break;
-    }
-    case MwMessage::CoreCrashed:
-        profile_stop();
-        break;
-    case MwMessage::CoreStarted:
-        m_guardCoreRestart.invalidate();
-        Configs::IsAdmin(true);
-        // The core may just have been given root, which the guard needs too.
-        if (Sys::KillSwitch::instance()->failedForPrivileges()) Sys::KillSwitch::instance()->apply();
-        if (settings->remember_enable && settings->remember_system_proxy) {
-            set_spmode_system_proxy(true, false);
-        }
-        if ((settings->remember_enable && settings->remember_tun) || settings->flag_restart_tun_on) {
-            set_spmode_vpn(true, settings->flag_restart_tun_on);
-            settings->flag_restart_tun_on = false;
-        }
-        {
-            const int id = args.value(0).toInt();
-            const auto request = std::exchange(m_coreStartRequest, StartRequest{});
-            if (request.profileId >= 0 && request.profileId != id) {
-                emit start_finished(request.serial, request.profileId, StartOutcome::Superseded, {});
-            }
-            if (id >= 0) profile_start(request.profileId == id ? request : StartRequest{id});
-        }
-        refresh_status();
         break;
     }
 }

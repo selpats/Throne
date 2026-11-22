@@ -6,7 +6,9 @@
 
 #include "include/database/GroupsRepo.h"
 #include "include/configs/common/OutboundFactory.h"
-#include "include/ui/mainwindow.h"
+#include "include/engine/Lifecycle.h"
+#include "include/global/Configs.hpp"
+#include "include/global/Logger.hpp"
 
 
 namespace Configs {
@@ -31,6 +33,7 @@ namespace Configs {
                 traffic_dl INTEGER NOT NULL DEFAULT 0,
                 traffic_up INTEGER NOT NULL DEFAULT 0,
                 endpoint_json TEXT NOT NULL DEFAULT '{}',
+                service_checks TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 FOREIGN KEY(gid) REFERENCES groups(id) ON DELETE CASCADE
@@ -41,8 +44,11 @@ namespace Configs {
             db.exec("ALTER TABLE profiles ADD COLUMN latency_at INTEGER NOT NULL DEFAULT 0");
         if (!profilesColumnExists("endpoint_json"))
             db.exec("ALTER TABLE profiles ADD COLUMN endpoint_json TEXT NOT NULL DEFAULT '{}'");
+        if (!profilesColumnExists("service_checks"))
+            db.exec("ALTER TABLE profiles ADD COLUMN service_checks TEXT NOT NULL DEFAULT ''");
 
         db.exec("CREATE INDEX IF NOT EXISTS idx_profiles_name ON profiles(name)");
+        db.exec("CREATE INDEX IF NOT EXISTS idx_profiles_type ON profiles(type)");
     }
 
     bool ProfilesRepo::profilesColumnExists(const char* columnName) const {
@@ -67,14 +73,10 @@ namespace Configs {
         profile->ul_speed = json["ul_speed"].toString();
         profile->test_country = json["test_country"].toString();
         profile->ip_out = json["ip_out"].toString();
+        profile->service_checks = json["service_checks"].toString();
         profile->endpoint = EndpointSource::FromJson(json["endpoint"].toObject());
-        
-        QString type = profile->type;
-        if (type == "hysteria2") {
-            type = "hysteria";
-        }
 
-        Configs::outbound* outbound = Configs::NewOutboundByType(type);
+        Configs::outbound* outbound = Configs::NewOutboundByType(profile->type);
 
         profile->outbound = std::shared_ptr<Configs::outbound>(outbound);
         profile->outbound->profile_id = profile->id;
@@ -103,8 +105,8 @@ namespace Configs {
         db.exec(R"(
             INSERT INTO profiles
             (id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country,
-            ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json, service_checks)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 type = excluded.type, name = excluded.name, gid = excluded.gid,
                 latency = excluded.latency, latency_at = excluded.latency_at,
@@ -112,7 +114,7 @@ namespace Configs {
                 test_country = excluded.test_country, ip_out = excluded.ip_out,
                 outbound_json = excluded.outbound_json,
                 traffic_dl = excluded.traffic_dl, traffic_up = excluded.traffic_up,
-                endpoint_json = excluded.endpoint_json,
+                endpoint_json = excluded.endpoint_json, service_checks = excluded.service_checks,
                 updated_at = strftime('%s', 'now')
         )",
             id,
@@ -128,7 +130,8 @@ namespace Configs {
             outboundJson.toStdString(),
             static_cast<long long>(profile->traffic_downlink),
             static_cast<long long>(profile->traffic_uplink),
-            endpointJson.toStdString()
+            endpointJson.toStdString(),
+            profile->service_checks.toStdString()
         );
     }
 
@@ -153,6 +156,7 @@ namespace Configs {
         row.traffic_dl = static_cast<long long>(profile->traffic_downlink);
         row.traffic_up = static_cast<long long>(profile->traffic_uplink);
         row.endpoint_json = QJsonDocument(profile->endpoint.ToJson()).toJson(QJsonDocument::Compact).toStdString();
+        row.service_checks = profile->service_checks.toStdString();
         return row;
     }
 
@@ -181,14 +185,15 @@ namespace Configs {
             endpointDoc.isObject()) {
             json["endpoint"] = endpointDoc.object();
         }
-        
+        json["service_checks"] = QString::fromStdString(stmt.getColumn(14).getText());
+
         return profileFromJson(json);
     }
 
     std::shared_ptr<Profile> ProfilesRepo::loadFromDatabase(int id) const {
         auto query = db.query(R"(
             SELECT id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country,
-                   ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json
+                   ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json, service_checks
             FROM profiles WHERE id = ?
         )", id);
         if (!query || !query->executeStep()) {
@@ -209,15 +214,19 @@ namespace Configs {
         profile->id = newId;
         if (profile->outbound) profile->outbound->profile_id = newId;
         profile->gid = gid < 0 ? Configs::dataManager->settingsRepo->current_group : gid;
-        QMutexLocker locker(&mutex);
-        identityMap[newId] = std::weak_ptr<Profile>(profile);
-        saveToDatabase(profile.get(), profile->id);
-        if (auto group = dataManager->groupsRepo->GetGroup(profile->gid)) {
-            group->AddProfile(profile->id);
-            dataManager->groupsRepo->Save(group);
-        } else {
-            return false;
+        {
+            QMutexLocker locker(&mutex);
+            // DeleteGroup holds this lock while it deletes, so a group found here outlives the insert.
+            if (dataManager->groupsRepo->GetGroup(profile->gid) == nullptr) return false;
+            identityMap[newId] = std::weak_ptr<Profile>(profile);
+            saveToDatabase(profile.get(), profile->id);
+            ++revision;
         }
+        auto group = dataManager->groupsRepo->GetGroup(profile->gid);
+        if (group == nullptr) return false;
+        group->AddProfile(profile->id);
+        dataManager->groupsRepo->Save(group);
+        RepositionLater(QList<std::shared_ptr<Profile>>{profile}, SortInput::Membership);
         return true;
     }
 
@@ -236,6 +245,7 @@ namespace Configs {
         int firstId = NewProfileIDRange(n);
 
         QMutexLocker locker(&mutex);
+        if (dataManager->groupsRepo->GetGroup(gid) == nullptr) return false;
         for (int i = 0; i < n; ++i) {
             int id = firstId + i;
             toAdd[i]->id = id;
@@ -250,6 +260,7 @@ namespace Configs {
             rows.push_back(profileToInsertRow(toAdd[i].get(), toAdd[i]->id, toAdd[i]->gid));
         }
         db.execBatchInsertProfiles(rows);
+        ++revision;
 
         QList<int> profileIDs;
         for (const auto& profile : toAdd) {
@@ -282,7 +293,7 @@ namespace Configs {
             idList += QString::number(chunkIds[i]);
         }
         std::string sql = "SELECT id, type, name, gid, latency, latency_at, dl_speed, ul_speed, test_country, "
-                         "ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json FROM profiles WHERE id IN (" +
+                         "ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json, service_checks FROM profiles WHERE id IN (" +
                          idList.toStdString() + ") ORDER BY id";
         auto query = db.query(sql);
         if (!query) return result;
@@ -399,31 +410,53 @@ namespace Configs {
         return names;
     }
 
-    bool ProfilesRepo::BatchDeleteProfiles(QList<int>& ids, bool stopRunningProfile) {
+    bool ProfilesRepo::BatchDeleteProfiles(QList<int>& ids, bool stopRunningProfile, bool interactive, QList<HopReference>* clearedHops) {
         QSet<int> groupIDs;
-        if (ids.contains(dataManager->settingsRepo->started_id)) {
-            if (stopRunningProfile) GetMainWindow()->profile_stop(false, true, false);
-            else ids.removeAll(dataManager->settingsRepo->started_id);
+        if (const int startedId = Engine::Lifecycle::ResumeTargetId(); ids.contains(startedId)) {
+            if (stopRunningProfile) Engine::Lifecycle::StopRunningProfile(false, true, false, interactive);
+            else ids.removeAll(startedId);
         }
+        if (ids.isEmpty()) return true;
         auto profiles = GetProfileBatch(ids);
+        QList<int> existing;
         for (const auto& ent : profiles) {
             groupIDs.insert(ent->gid);
+            existing << ent->id;
         }
+        const std::vector<int> idVec(ids.begin(), ids.end());
+        const bool deleted = DeleteAndForget([&](QList<int>& deletedIds) {
+            const bool ok = db.transaction("ProfilesRepo::BatchDeleteProfiles", [&] {
+                db.execDeleteByIdInThrow("profiles", "id", idVec);
+                return true;
+            });
+            if (ok) deletedIds = existing;
+            return ok;
+        });
+        // Listings change only once the rows are gone, so a failed delete leaves no unlisted rows behind.
+        if (!deleted) return false;
         for (auto groupID : groupIDs) {
             auto group = dataManager->groupsRepo->GetGroup(groupID);
             if (!group) {
-                MW_show_log("Could not find group with id " + Int2String(groupID));
-                return false;
+                MW_show_log("Could not find group with id " + Int2String(groupID) + "; its profiles were deleted anyway");
+                continue;
             }
             group->RemoveProfileBatch(ids);
             dataManager->groupsRepo->Save(group);
         }
+        auto cleared = dataManager->groupsRepo->ClearHopReferences(QSet<int>(existing.cbegin(), existing.cend()));
+        if (clearedHops != nullptr) *clearedHops = std::move(cleared);
+        return true;
+    }
+
+    bool ProfilesRepo::DeleteAndForget(const std::function<bool(QList<int>& deletedIds)>& deleteRows) {
         QMutexLocker locker(&mutex);
-        for (int id : ids) identityMap.erase(id);
-        if (!ids.isEmpty()) {
-            std::vector<int> idVec(ids.begin(), ids.end());
-            db.execDeleteByIdIn("profiles", "id", idVec);
+        QList<int> deletedIds;
+        if (!deleteRows(deletedIds)) return false;
+        for (const int id : deletedIds) {
+            identityMap.erase(id);
+            tombstones.insert(id);
         }
+        ++revision;
         return true;
     }
 
@@ -445,6 +478,16 @@ namespace Configs {
             while (query->executeStep()) {
                 ids.append(query->getColumn(0).getInt());
             }
+        }
+        return ids;
+    }
+
+    QList<int> ProfilesRepo::GetProfileIdsByTypeContaining(const QString& type, const QString& needle) const {
+        QList<int> ids;
+        auto query = db.query("SELECT id FROM profiles WHERE type = ? AND instr(lower(outbound_json), ?) > 0 ORDER BY id",
+                              type.toStdString(), needle.toLower().toStdString());
+        if (query) {
+            while (query->executeStep()) ids.append(query->getColumn(0).getInt());
         }
         return ids;
     }
@@ -473,11 +516,17 @@ namespace Configs {
             return false;
         }
         
-        QMutexLocker locker(&mutex);
-        saveToDatabase(profile.get(), profile->id);
-        identityMap[profile->id] = std::weak_ptr<Profile>(profile);
-        
-        return true;
+        {
+            QMutexLocker locker(&mutex);
+            if (!tombstones.contains(profile->id)) {
+                saveToDatabase(profile.get(), profile->id);
+                identityMap[profile->id] = std::weak_ptr<Profile>(profile);
+                ++revision;
+                return true;
+            }
+        }
+        LOG_DEBUG(QString("Profile %1 was deleted; not saving it").arg(profile->id));
+        return false;
     }
 
     bool ProfilesRepo::SaveTraffic(const std::shared_ptr<Profile>& profile) {
@@ -500,19 +549,15 @@ namespace Configs {
         }
         if (valid.isEmpty()) return;
         QMutexLocker locker(&mutex);
-        try {
-            db.execThrow("BEGIN IMMEDIATE");
+        db.transaction("SaveTrafficBatch", [&] {
             for (const auto& p : valid) {
                 db.execThrow("UPDATE profiles SET traffic_dl = ?, traffic_up = ? WHERE id = ?",
                              static_cast<long long>(p->traffic_downlink),
                              static_cast<long long>(p->traffic_uplink),
                              p->id);
             }
-            db.execThrow("COMMIT");
-        } catch (std::exception& e) {
-            try { db.execThrow("ROLLBACK"); } catch (...) {}
-            NotifyError("SaveTrafficBatch", e);
-        }
+            return true;
+        });
     }
 
     void ProfilesRepo::SaveBatch(const QList<std::shared_ptr<Profile>>& profiles) {
@@ -528,10 +573,14 @@ namespace Configs {
                 rows.push_back(profileToInsertRow(p.get(), p->id, p->gid));
             }
             QMutexLocker locker(&mutex);
+            const auto skipped = std::erase_if(rows, [this](const ProfileInsertRow& row) { return tombstones.contains(row.id); });
             db.execBatchReplaceProfiles(rows);
             for (const auto& p : valid) {
-                identityMap[p->id] = std::weak_ptr<Profile>(p);
+                if (!tombstones.contains(p->id)) identityMap[p->id] = std::weak_ptr<Profile>(p);
             }
+            if (!rows.empty()) ++revision;
+            locker.unlock();
+            if (skipped > 0) LOG_DEBUG(QString("SaveBatch skipped %1 deleted profiles").arg(skipped));
         });
     }
 }

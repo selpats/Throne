@@ -5,6 +5,10 @@
 class QLineEdit;
 class QRadioButton;
 
+namespace Validation {
+    class Form;
+}
+
 class DialogNewScan : public QDialog {
     Q_OBJECT
 
@@ -19,5 +23,8 @@ private:
     QLineEdit *nameEdit;
     QRadioButton *genericRadio;
     QRadioButton *warpRadio;
+    QRadioButton *resolverRadio;
+    QRadioButton *tuneRadio;
+    Validation::Form *form;
     int createdId = -1;
 };

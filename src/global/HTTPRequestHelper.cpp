@@ -7,16 +7,70 @@
 #include <QSslSocket>
 #include <QTimer>
 #include <QFile>
-#include <QApplication>
+#include <QEventLoop>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QStringList>
 
 
 
+#include "include/engine/Lifecycle.h"
 #include "include/global/Configs.hpp"
 #include "include/global/LocalNetwork.hpp"
-#include "include/ui/mainwindow.h"
+#include "include/sys/KillSwitch.hpp"
 
 namespace Configs_network {
+    namespace {
+        constexpr int kDownloadAssetIdleTimeoutMs = 30000;
+
+        QMutex downloadProgressSinkMutex;
+        NetworkRequestHelper::DownloadProgressSink downloadProgressSink;
+
+        NetworkRequestHelper::DownloadProgressSink loadDownloadProgressSink() {
+            QMutexLocker locker(&downloadProgressSinkMutex);
+            return downloadProgressSink;
+        }
+
+        // The sink is looked up again on the main thread, so one cleared meanwhile is never called.
+        void reportDownloadProgress(const DownloadProgressReport &report, bool show) {
+            if (!loadDownloadProgressSink()) return;
+            runOnUiThread([report, show] {
+                if (const auto sink = loadDownloadProgressSink()) sink(report, show);
+            });
+        }
+    } // namespace
+
+    QNetworkProxy MixedInboundProxy() {
+        const auto &settings = Configs::dataManager->settingsRepo;
+        QNetworkProxy p;
+        p.setType(QNetworkProxy::HttpProxy);
+        p.setHostName(LocalNetwork::InboundConnectHost());
+        p.setPort(settings->inbound_socks_port);
+        if (settings->inbound_auth) {
+            p.setUser(settings->inbound_user);
+            p.setPassword(settings->inbound_pass);
+        }
+        return p;
+    }
+
+    bool RequestUsesMixedInbound(bool useProxy, QString *error) {
+        const auto &settings = Configs::dataManager->settingsRepo;
+        const bool guarded = Sys::KillSwitch::BlocksAppTraffic();
+        if (!settings->net_use_proxy && !settings->spmode_system_proxy && !useProxy && !guarded) return false;
+        if (Engine::Lifecycle::RunningProfileId() < 0) {
+            *error = guarded ? QObject::tr("The kill switch blocks this request while no profile is running.")
+                             : QObject::tr("Request with proxy but no profile started.");
+            return false;
+        }
+        if (!settings->disable_mixed_inbound) return true;
+        if (!settings->spmode_vpn) *error = QObject::tr("Request with proxy but the mixed inbound is disabled and Tun mode is off.");
+        return false;
+    }
+
+    void NetworkRequestHelper::SetDownloadProgressSink(DownloadProgressSink sink) {
+        QMutexLocker locker(&downloadProgressSinkMutex);
+        downloadProgressSink = std::move(sink);
+    }
 
     HTTPResponse NetworkRequestHelper::HttpGet(const QString &url, bool useProxy) {
         HttpGetOptions options;
@@ -33,20 +87,9 @@ namespace Configs_network {
         QNetworkAccessManager accessManager;
         accessManager.setTransferTimeout(10000);
         request.setUrl(url);
-        if (Configs::dataManager->settingsRepo->net_use_proxy || Configs::dataManager->settingsRepo->spmode_system_proxy || options.useProxy) {
-            if (Configs::dataManager->settingsRepo->started_id < 0) {
-                return HTTPResponse{QObject::tr("Request with proxy but no profile started.")};
-            }
-            QNetworkProxy p;
-            p.setType(QNetworkProxy::HttpProxy);
-            p.setHostName(LocalNetwork::InboundConnectHost());
-            p.setPort(Configs::dataManager->settingsRepo->inbound_socks_port);
-            if (Configs::dataManager->settingsRepo->inbound_auth) {
-                p.setUser(Configs::dataManager->settingsRepo->inbound_user);
-                p.setPassword(Configs::dataManager->settingsRepo->inbound_pass);
-            }
-            accessManager.setProxy(p);
-        }
+        QString proxyError;
+        if (RequestUsesMixedInbound(options.useProxy, &proxyError)) accessManager.setProxy(MixedInboundProxy());
+        else if (!proxyError.isEmpty()) return HTTPResponse{proxyError};
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
         request.setAttribute(QNetworkRequest::Http2AllowedAttribute, options.http2);
         request.setHeader(QNetworkRequest::KnownHeaders::UserAgentHeader,
@@ -86,6 +129,7 @@ namespace Configs_network {
 
         HTTPResponse result;
         result.header = _reply->rawHeaderPairs();
+        result.status = _reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (tooLarge) {
             result.error = QObject::tr("Response larger than %1 MB").arg(maxBytes / (1024 * 1024));
         } else {
@@ -107,21 +151,11 @@ namespace Configs_network {
     QString NetworkRequestHelper::DownloadAsset(const QString &url, const QString &fileName, bool useProxy, bool strictTls) {
         QNetworkRequest request;
         QNetworkAccessManager accessManager;
+        accessManager.setTransferTimeout(kDownloadAssetIdleTimeoutMs);
         request.setUrl(url);
-        if (Configs::dataManager->settingsRepo->net_use_proxy || Configs::dataManager->settingsRepo->spmode_system_proxy || useProxy) {
-            if (Configs::dataManager->settingsRepo->started_id < 0) {
-                return QObject::tr("Request with proxy but no profile started.");
-            }
-            QNetworkProxy p;
-            p.setType(QNetworkProxy::HttpProxy);
-            p.setHostName(LocalNetwork::InboundConnectHost());
-            p.setPort(Configs::dataManager->settingsRepo->inbound_socks_port);
-            if (Configs::dataManager->settingsRepo->inbound_auth) {
-                p.setUser(Configs::dataManager->settingsRepo->inbound_user);
-                p.setPassword(Configs::dataManager->settingsRepo->inbound_pass);
-            }
-            accessManager.setProxy(p);
-        }
+        QString proxyError;
+        if (RequestUsesMixedInbound(useProxy, &proxyError)) accessManager.setProxy(MixedInboundProxy());
+        else if (!proxyError.isEmpty()) return proxyError;
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
         const bool insecure = Configs::dataManager->settingsRepo->net_insecure && !strictTls;
         if (insecure) {
@@ -140,25 +174,22 @@ namespace Configs_network {
         });
         connect(_reply, &QNetworkReply::downloadProgress, _reply, [&](qint64 bytesReceived, qint64 bytesTotal)
         {
-            runOnUiThread([=]{
-                GetMainWindow()->setDownloadReport(DownloadProgressReport{fileName, bytesReceived, bytesTotal}, true);
-                GetMainWindow()->UpdateDataView();
-            });
+            reportDownloadProgress(DownloadProgressReport{fileName, bytesReceived, bytesTotal}, true);
         });
         QEventLoop loop;
         connect(_reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
         loop.exec();
-        runOnUiThread([=]
-        {
-            GetMainWindow()->setDownloadReport({}, false);
-            GetMainWindow()->UpdateDataView(true);
-        });
+        reportDownloadProgress({}, false);
         auto netErr = _reply->error();
         const QString netErrStr = _reply->errorString();
         const int httpStatus = _reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const QByteArray body = _reply->readAll();
         _reply->deleteLater();
 
+        // Nothing else aborts this reply, so a cancel is the idle transfer timeout firing.
+        if (netErr == QNetworkReply::NetworkError::OperationCanceledError) {
+            return QObject::tr("Download stalled: no data arrived for %1 seconds.").arg(kDownloadAssetIdleTimeoutMs / 1000);
+        }
         if (netErr != QNetworkReply::NetworkError::NoError) {
             return netErrStr;
         }

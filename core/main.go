@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	runtimeDebug "runtime/debug"
 	"runtime/metrics"
@@ -15,10 +16,13 @@ import (
 	"github.com/xtls/xray-core/core"
 
 	"ThroneCore/internal/boxmain"
+	"ThroneCore/internal/capcheck"
+	"ThroneCore/internal/elevation"
 	"ThroneCore/internal/guard"
 	"ThroneCore/internal/ipc"
 	"ThroneCore/internal/parentcheck"
 	"ThroneCore/internal/rpc"
+	"ThroneCore/internal/sysdns"
 
 	C "github.com/sagernet/sing-box/constant"
 
@@ -81,66 +85,94 @@ func writeHeapProfile() (string, error) {
 	return f.Name(), f.Sync()
 }
 
-func RunCore() {
+func watchParent(pid int, name string) {
+	parent, err := os.FindProcess(pid)
+	if err != nil {
+		log.Fatalln("find "+name+":", err)
+	}
+	if runtime.GOOS == "windows" {
+		state, err := parent.Wait()
+		log.Fatalln(name+" exited:", state, err)
+	} else {
+		for {
+			time.Sleep(time.Second * 10)
+			err = parent.Signal(syscall.Signal(0))
+			if err != nil {
+				sysdns.Release()
+				log.Fatalln(name+" exited:", err)
+			}
+		}
+	}
+}
+
+// Logout and shutdown end the core with SIGTERM, whose default action would leave the system DNS on a listener that is gone.
+func releaseOnSignal() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	received := <-signals
+	sysdns.Release()
+	log.Fatalln("received", received)
+}
+
+// attached is set in the elevated child of a Windows stub, which already holds Throne's pipe and has no parentcheck parent.
+func RunCore(attached *elevation.Attached) {
 	socketName := os.Getenv("THRONE_CORE_SOCKET")
 	if socketName == "" {
 		log.Fatal("THRONE_CORE_SOCKET not set")
 	}
 	debug := os.Getenv("THRONE_CORE_DEBUG") == "1"
 
-	parentcheck.CheckParentProcess()
+	if attached == nil {
+		parentcheck.CheckParentProcess()
+	}
 	if err := guard.ApplyIdentity(); err != nil {
-		log.Fatalf("kill switch: cannot adopt the guard group: %v", err)
+		fmt.Fprintf(os.Stderr, "kill switch: cannot adopt the guard group: %v\n", err)
+		os.Exit(guard.IdentityExitCode)
 	}
 	guard.CleanupStale()
+	sysdns.RestoreStale()
+	if runtime.GOOS == "darwin" {
+		go releaseOnSignal()
+	}
 
-	go func() {
-		parent, err := os.FindProcess(parentcheck.ParentPID)
-		if err != nil {
-			log.Fatalln("find parent:", err)
-		}
-		if runtime.GOOS == "windows" {
-			state, err := parent.Wait()
-			log.Fatalln("parent exited:", state, err)
-		} else {
-			for {
-				time.Sleep(time.Second * 10)
-				err = parent.Signal(syscall.Signal(0))
-				if err != nil {
-					log.Fatalln("parent exited:", err)
-				}
-			}
-		}
-	}()
+	go watchParent(parentcheck.ParentPID, "parent")
+	if attached != nil {
+		go watchParent(attached.StubPID, "stub")
+	}
 
 	boxmain.DisableColor()
 
 	var conn net.Conn
-	var err error
-	for i := 0; i < 10; i++ {
-		conn, err = ipc.ConnectIPC(socketName, parentcheck.ParentPID)
-		if err == nil {
-			break
+	if attached != nil {
+		conn = attached.Conn
+	} else {
+		var err error
+		for i := 0; i < 10; i++ {
+			conn, err = ipc.ConnectIPC(socketName, parentcheck.ParentPID)
+			if err == nil {
+				break
+			}
+			log.Printf("IPC connect attempt %d/10 failed: %v", i+1, err)
+			time.Sleep(500 * time.Millisecond)
 		}
-		log.Printf("IPC connect attempt %d/10 failed: %v", i+1, err)
-		time.Sleep(500 * time.Millisecond)
-	}
-	if err != nil {
-		log.Fatalf("failed to connect to GUI socket after 10 attempts: %v", err)
+		if err != nil {
+			log.Fatalf("failed to connect to GUI socket after 10 attempts: %v", err)
+		}
 	}
 
 	fmt.Println("Core Has Successfully Connected to Throne!")
 	rpc.Serve(conn, debug)
+	sysdns.Release()
 	log.Fatal("IPC connection dropped, exiting")
 }
 
-func main() {
-	// Before anything prints: stdout is the guard's protocol channel.
-	if len(os.Args) > 1 && os.Args[1] == "--guard" {
-		parentcheck.CheckParentProcess()
-		guard.Run(parentcheck.ParentPID)
-	}
+func printVersions() {
+	fmt.Println("sing-box:", C.Version)
+	fmt.Println("Xray-core:", core.Version())
+	fmt.Println("Go:", runtime.Version())
+}
 
+func runCore(attached *elevation.Attached) {
 	defer func() {
 		if err := recover(); err != nil {
 			// The exit code is all the GUI has to tell a panic from a clean stop.
@@ -148,12 +180,55 @@ func main() {
 			os.Exit(2)
 		}
 	}()
-	fmt.Println("sing-box:", C.Version)
-	fmt.Println("Xray-core:", core.Version())
+	printVersions()
 	fmt.Println()
 	runtimeDebug.SetMemoryLimit(memoryLimit)
 	go watchMemory()
 
-	RunCore()
-	return
+	RunCore(attached)
+}
+
+func runAttached(attached elevation.Attached) {
+	if attached.Mode == elevation.ModeGuard {
+		guard.PermitExecutable(attached.Core)
+		guard.Run(attached.GuiPID, attached.StubPID)
+	}
+	runCore(&attached)
+}
+
+func main() {
+	// Before anything prints: stdout is the guard's protocol channel and the --check line.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--attach":
+			elevation.RunAttach(os.Args[2:], runAttached)
+		case "--guard":
+			parentcheck.CheckParentProcess()
+			if elevation.Requested() {
+				elevation.RunStub(elevation.ModeGuard)
+			}
+			guard.Run(parentcheck.ParentPID)
+		case "--check":
+			parentcheck.CheckParentProcess()
+			if err := capcheck.Print(os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "check: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case "--restore-dns":
+			parentcheck.CheckParentProcess()
+			sysdns.RestoreStale()
+			os.Exit(0)
+		case "--version":
+			printVersions()
+			os.Exit(0)
+		}
+	}
+
+	// The stub prints nothing: stdout belongs to the elevated child.
+	if elevation.Requested() {
+		parentcheck.CheckParentProcess()
+		elevation.RunStub(elevation.ModeCore)
+	}
+	runCore(nil)
 }

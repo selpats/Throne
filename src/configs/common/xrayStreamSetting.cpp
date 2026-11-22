@@ -1,11 +1,278 @@
 #include "include/configs/common/xrayStreamSetting.h"
+#include "include/configs/common/TLS.h"
+#include <QCoreApplication>
+#include <QHash>
+#include <QRegularExpression>
+#include <QSet>
+#include <QUrl>
 #include <QUrlQuery>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include "include/configs/common/utils.h"
+#include "include/configs/ParseDiagnostics.h"
+#include "include/database/entities/RouteProfile.h"
+#include "include/global/Utils.hpp"
+
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <utility>
 
 namespace Configs {
     namespace {
+        // Xray infra/conf ParseRangeString plus ensureOrder; false where Xray refuses the text.
+        bool xrayStreamRange(const QString& text, qint64& from, qint64& to)
+        {
+            const auto t = text.trimmed();
+            from = to = 0;
+            if (t.isEmpty()) return true;
+            if (!Validation::IntOrRange(t, INT_MIN, INT_MAX, Validation::Empty::Allowed, true).isEmpty()) return false;
+            const auto dash = t.indexOf('-', t.startsWith('-') ? 1 : 0);
+            from = Validation::ToInt(dash < 0 ? t : t.left(dash)).value_or(0);
+            to = Validation::ToInt(dash < 0 ? t : t.mid(dash + 1)).value_or(0);
+            if (from > to) std::swap(from, to);
+            return true;
+        }
+
+        using XDriveTuning = std::array<std::pair<QString, qint64 xrayXDrive::*>, 8>;
+
+        const XDriveTuning& xdriveTuning()
+        {
+            static const XDriveTuning keys = {{
+                {QStringLiteral("segmentBytes"), &xrayXDrive::segmentBytes},
+                {QStringLiteral("flushIntervalMs"), &xrayXDrive::flushIntervalMs},
+                {QStringLiteral("pollIntervalMs"), &xrayXDrive::pollIntervalMs},
+                {QStringLiteral("maxPollIntervalMs"), &xrayXDrive::maxPollIntervalMs},
+                {QStringLiteral("sessionTtlSeconds"), &xrayXDrive::sessionTtlSeconds},
+                {QStringLiteral("concurrency"), &xrayXDrive::concurrency},
+                {QStringLiteral("eagerWindowMs"), &xrayXDrive::eagerWindowMs},
+                {QStringLiteral("holeTimeoutMs"), &xrayXDrive::holeTimeoutMs},
+            }};
+            return keys;
+        }
+
+        // Go httpguts.ValidHeaderFieldValue: no control characters but space and tab.
+        bool xdriveHeaderValue(const QString& text)
+        {
+            return std::none_of(text.cbegin(), text.cend(), [](QChar c) { return (c.unicode() < 0x20 && c != '\t') || c.unicode() == 0x7f; });
+        }
+
+        // Xray validS3Name: no control characters or backslashes, and no empty, "." or ".." component.
+        bool xdriveS3Name(const QString& name)
+        {
+            if (std::any_of(name.cbegin(), name.cend(), [](QChar c) { return c.unicode() < 0x20 || c.unicode() == 0x7f || c == '\\'; })) return false;
+            const auto parts = name.split('/');
+            return std::none_of(parts.cbegin(), parts.cend(), [](const QString& p) { return p.isEmpty() || p == "." || p == ".."; });
+        }
+
+        // Xray transport/internet/tls/tls.go: PresetFingerprints, ModernFingerprints and OtherFingerprints, matched lower-cased.
+        const QStringList& xrayStreamFingerprints()
+        {
+            static const QStringList names = {
+                "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "randomizednoalpn", "unsafe",
+                "hellofirefox_120", "hellofirefox_148", "hellochrome_120", "hellochrome_131", "hellochrome_133", "helloios_13",
+                "helloios_14", "helloedge_106", "hellosafari_26_3", "hello360_11_0", "helloqq_11_1",
+                "hellogolang", "hellorandomized", "hellorandomizedalpn", "hellorandomizednoalpn", "hellofirefox_auto",
+                "hellofirefox_55", "hellofirefox_56", "hellofirefox_63", "hellofirefox_65", "hellofirefox_99", "hellofirefox_102",
+                "hellofirefox_105", "hellochrome_auto", "hellochrome_58", "hellochrome_62", "hellochrome_70", "hellochrome_72",
+                "hellochrome_83", "hellochrome_87", "hellochrome_96", "hellochrome_100", "hellochrome_102", "hellochrome_106_shuffle",
+                "helloios_auto", "helloios_11_1", "helloios_12_1", "helloandroid_11_okhttp", "helloedge_85", "helloedge_auto",
+                "hellosafari_16_0", "hellosafari_auto", "hello360_auto", "hello360_7_5", "helloqq_auto", "hellochrome_100_psk",
+                "hellochrome_112_psk_shuf", "hellochrome_114_padding_psk_shuf", "hellochrome_115_pq", "hellochrome_115_pq_psk",
+                "hellochrome_120_pq",
+            };
+            return names;
+        }
+
+        // Unknown names are dropped with a note so Xray's default applies instead of a start failure.
+        QString xrayStreamKnownFingerprint(const QString& raw, bool reality, const QString& field)
+        {
+            const auto fingerprint = raw.trimmed();
+            return AcceptOptional(field, Checks::XrayFingerprint(fingerprint, reality), fingerprint) ? fingerprint : QString();
+        }
+
+        void xrayStreamAdd(Validation::Issues& issues, Validation::Severity severity, const QString& field, const QString& message,
+                           const QString& value = {})
+        {
+            if (!message.isEmpty()) issues.append({severity, field, message, value});
+        }
+
+        // Every key Xray's case-folding decoder reads as name.
+        QStringList xrayStreamKeysNamed(const QJsonObject& o, const QString& name)
+        {
+            QStringList keys;
+            for (auto it = o.constBegin(); it != o.constEnd(); ++it) {
+                if (it.key().compare(name, Qt::CaseInsensitive) == 0) keys << it.key();
+            }
+            return keys;
+        }
+
+        bool xrayStreamRemoveNamed(QJsonObject& o, const QString& name)
+        {
+            const auto keys = xrayStreamKeysNamed(o, name);
+            for (const auto& key : keys) o.remove(key);
+            return !keys.isEmpty();
+        }
+
+        // Applies edit to every object spelling of name in o; true when any changed.
+        template <typename Edit>
+        bool xrayStreamEditNamed(QJsonObject& o, const QString& name, Edit&& edit)
+        {
+            bool changed = false;
+            for (const auto& key : xrayStreamKeysNamed(o, name)) {
+                if (!o.value(key).isObject()) continue;
+                auto inner = o.value(key).toObject();
+                if (!edit(inner)) continue;
+                o[key] = inner;
+                changed = true;
+            }
+            return changed;
+        }
+
+        // dialerProxy names an outbound of the source config, and domainStrategy would outrank ThroneWiring's resolver; Xray folds case.
+        bool xrayStreamStripDialerKeys(QJsonObject& sockopt)
+        {
+            bool removed = xrayStreamRemoveNamed(sockopt, QStringLiteral("dialerProxy"));
+            removed |= xrayStreamRemoveNamed(sockopt, QStringLiteral("domainStrategy"));
+            return removed;
+        }
+
+        // An object inside a local copy, with its path for messages ("" or ending in '.').
+        struct XrayStreamNode {
+            QJsonObject* object;
+            QString at;
+        };
+
+        QList<XrayStreamNode> xrayStreamRoot(QJsonObject& object, const QString& at = {})
+        {
+            return {XrayStreamNode{&object, at}};
+        }
+
+        // Go merges every spelling of a pointer field, holders in turn, into one struct and a null discards the earlier ones: drop those, edit the rest.
+        template <typename Edit>
+        void xrayStreamEditLive(const QList<XrayStreamNode>& holders, const QString& name, bool create, Edit&& edit)
+        {
+            QList<std::pair<XrayStreamNode, QString>> spellings;
+            for (const auto& holder : holders) {
+                for (const auto& key : xrayStreamKeysNamed(*holder.object, name)) spellings.append({holder, key});
+            }
+            qsizetype discarded = 0;
+            for (qsizetype i = 0; i < spellings.size(); ++i) {
+                if (spellings[i].first.object->value(spellings[i].second).isNull()) discarded = i + 1;
+            }
+            for (qsizetype i = 0; i < discarded; ++i) spellings[i].first.object->remove(spellings[i].second);
+            spellings.remove(0, discarded);
+            // Any other non-object makes Xray refuse the config.
+            spellings.removeIf([](const std::pair<XrayStreamNode, QString>& s) { return !s.first.object->value(s.second).isObject(); });
+            if (spellings.isEmpty()) {
+                if (!create || holders.isEmpty()) return;
+                holders.last().object->insert(name, QJsonObject());
+                spellings.append({holders.last(), name});
+            }
+            QList<QJsonObject> objects;
+            for (const auto& spelling : spellings) objects << spelling.first.object->value(spelling.second).toObject();
+            QList<XrayStreamNode> live;
+            for (qsizetype i = 0; i < spellings.size(); ++i) {
+                live.append({&objects[i], spellings[i].first.at + spellings[i].second + QLatin1Char('.')});
+            }
+            edit(std::as_const(live));
+            for (qsizetype i = 0; i < spellings.size(); ++i) spellings[i].first.object->insert(spellings[i].second, objects[i]);
+        }
+
+        // The value Go keeps for a field across spellings: the last one, a null resetting only a pointer field; Undefined when unset.
+        QJsonValue xrayStreamLast(const QList<XrayStreamNode>& nodes, const QString& name, bool pointer, QString* at = nullptr)
+        {
+            QJsonValue result(QJsonValue::Undefined);
+            for (const auto& node : nodes) {
+                for (const auto& key : xrayStreamKeysNamed(*node.object, name)) {
+                    const auto value = node.object->value(key);
+                    if (value.isNull() && !pointer) continue;
+                    result = value;
+                    if (at != nullptr) *at = node.at + key;
+                }
+            }
+            return result;
+        }
+
+        // A set method outranks network, and neither means tcp; only the XHTTP dialer reads downloadSettings.
+        bool xrayStreamDialsXHTTP(const QList<XrayStreamNode>& streams)
+        {
+            auto transport = xrayStreamLast(streams, QStringLiteral("method"), true);
+            if (transport.isNull() || transport.isUndefined()) transport = xrayStreamLast(streams, QStringLiteral("network"), true);
+            const auto name = XrayLower(transport.toString());
+            return name == "xhttp" || name == "splithttp";
+        }
+
+        // xhttpSettings outranks splithttpSettings, and extra is a json.RawMessage: its last spelling, even a null one, replaces the rest.
+        template <typename Edit>
+        void xrayStreamEditDownloadLeg(const QList<XrayStreamNode>& streams, Edit&& edit)
+        {
+            const auto fromHolders = [&](const QList<XrayStreamNode>& holders) {
+                const XrayStreamNode* extraHolder = nullptr;
+                QString extraKey;
+                for (const auto& holder : holders) {
+                    for (const auto& key : xrayStreamKeysNamed(*holder.object, QStringLiteral("extra"))) {
+                        extraHolder = &holder;
+                        extraKey = key;
+                    }
+                }
+                if (extraHolder == nullptr) {
+                    xrayStreamEditLive(holders, QStringLiteral("downloadSettings"), false, edit);
+                    return;
+                }
+                if (!extraHolder->object->value(extraKey).isObject()) return;
+                auto extra = extraHolder->object->value(extraKey).toObject();
+                xrayStreamEditLive(xrayStreamRoot(extra, extraHolder->at + extraKey + QLatin1Char('.')), QStringLiteral("downloadSettings"), false, edit);
+                extraHolder->object->insert(extraKey, extra);
+            };
+            bool xhttp = false;
+            xrayStreamEditLive(streams, QStringLiteral("xhttpSettings"), false, [&](const QList<XrayStreamNode>& holders) {
+                xhttp = true;
+                fromHolders(holders);
+            });
+            if (!xhttp) xrayStreamEditLive(streams, QStringLiteral("splithttpSettings"), false, fromHolders);
+        }
+
+        // Every spelling loses the key and it is written once, into the last live sockopt, so Go's merge keeps it.
+        void xrayStreamSetSockopt(const QList<XrayStreamNode>& streams, const QString& key, const QString& value)
+        {
+            xrayStreamEditLive(streams, QStringLiteral("sockopt"), true, [&](const QList<XrayStreamNode>& sockopts) {
+                for (const auto& sockopt : sockopts) xrayStreamRemoveNamed(*sockopt.object, key);
+                sockopts.last().object->insert(key, value);
+            });
+        }
+
+        // Xray's XHTTP dialer dereferences the download leg's destination and casts its transport settings unchecked: either crashes the core.
+        void xrayStreamDownloadEndpoint(Validation::Issues& issues, const QList<XrayStreamNode>& leg)
+        {
+            const auto at = leg.last().at;
+            QString addressAt = at + "address", portAt = at + "port", methodAt, networkAt = at + "network";
+            const auto address = xrayStreamLast(leg, QStringLiteral("address"), true, &addressAt);
+            const auto port = xrayStreamLast(leg, QStringLiteral("port"), false, &portAt);
+            const auto method = xrayStreamLast(leg, QStringLiteral("method"), true, &methodAt);
+            const auto network = xrayStreamLast(leg, QStringLiteral("network"), true, &networkAt);
+            const bool byMethod = !method.isNull() && !method.isUndefined();
+            const auto transport = byMethod ? method : network;
+            const auto transportName = transport.isString() ? XrayLower(transport.toString())
+                                     : transport.isNull() || transport.isUndefined() ? QStringLiteral("tcp") : QString();
+            if (transportName != "xhttp" && transportName != "splithttp") {
+                xrayStreamAdd(issues, Validation::Severity::Error, byMethod ? methodAt : networkAt,
+                              QCoreApplication::translate("Validation", "The download leg must use XHTTP too: write \"network\": \"xhttp\"."),
+                              transport.toString());
+            }
+            if (!address.isString() || address.toString().trimmed().isEmpty()) {
+                xrayStreamAdd(issues, Validation::Severity::Error, addressAt,
+                              QCoreApplication::translate("Validation", "Add the download server's address, for example \"address\": \"dl.example.com\"."));
+            }
+            const auto number = port.toDouble();
+            if (!port.isDouble() || number != std::floor(number) || number < 1 || number > 65535) {
+                xrayStreamAdd(issues, Validation::Severity::Error, portAt,
+                              QCoreApplication::translate("Validation", "Must be a port number from 1 to 65535, written without quotes, for example \"port\": 443."));
+            }
+        }
+
         QString qs(const std::string& value) {
             return QString::fromStdString(value);
         }
@@ -49,40 +316,96 @@ namespace Configs {
             return xmux;
         }
 
-        QJsonObject buildDownloadSettingsObject(const clash::xhttpDownloadSettings& settings) {
+        // mihomo takes every unset download-settings value from the proxy itself, and its download leg copies the whole upload XHTTP config.
+        QJsonObject buildDownloadSettingsObject(const clash::Proxies& proxy, QJsonObject extra) {
+            const auto& settings = proxy.xhttp_opts.download_settings;
             QJsonObject object;
-            if (hasText(settings.server)) object["address"] = qs(settings.server);
-            object["port"] = int(settings.port);
+            if (const auto server = toAceHost(qs(settings.server.value_or(proxy.server)).trimmed()); !server.isEmpty()) object["address"] = server;
+            object["port"] = int(settings.port.value_or(proxy.port));
             object["network"] = "xhttp";
 
-            if (!settings.reality_opts.public_key.empty()) {
+            const bool uploadReality = proxy.tls && !proxy.reality_opts.public_key.empty();
+            // The upload leg uses its REALITY options only with tls on.
+            const auto downloadReality = settings.reality_opts.value_or(proxy.tls ? proxy.reality_opts : clash::realityOpts{});
+            const auto serverName = qs(settings.servername.value_or(proxy.servername.empty() ? proxy.sni : proxy.servername)).trimmed();
+            const auto clientFingerprint = settings.client_fingerprint.value_or(proxy.client_fingerprint);
+            // Unknown names are dropped as on the upload leg, which has already reported an inherited one it refuses too.
+            const auto knownFingerprint = [&](bool reality) {
+                const auto fingerprint = qs(clientFingerprint).trimmed();
+                const auto message = Checks::XrayFingerprint(fingerprint, reality);
+                if (message.isEmpty()) return fingerprint;
+                if (settings.client_fingerprint || !proxy.tls || Checks::XrayFingerprint(fingerprint, uploadReality).isEmpty()) {
+                    AcceptOptional(settings.client_fingerprint ? "xhttp-opts.download-settings.client-fingerprint" : "client-fingerprint", message, fingerprint);
+                }
+                return QString();
+            };
+
+            if (!downloadReality.public_key.empty()) {
                 object["security"] = "reality";
                 QJsonObject reality;
                 reality["show"] = false;
-                if (hasText(settings.servername)) reality["serverName"] = toAceHost(qs(settings.servername));
-                if (hasText(settings.client_fingerprint)) reality["fingerprint"] = qs(settings.client_fingerprint);
-                reality["publicKey"] = qs(settings.reality_opts.public_key);
-                if (hasText(settings.reality_opts.short_id)) reality["shortId"] = qs(settings.reality_opts.short_id);
+                if (!serverName.isEmpty()) reality["serverName"] = toAceHost(serverName);
+                // REALITY needs uTLS, so mihomo's "none" and Xray's "unsafe" leave Xray's default, as xrayReality::Build does.
+                if (!IsClashNoFingerprint(clientFingerprint)) {
+                    if (const auto fingerprint = knownFingerprint(true); !fingerprint.isEmpty() && fingerprint.toLower() != tlsUnsafeFingerprint) {
+                        reality["fingerprint"] = fingerprint;
+                    }
+                }
+                const QString at = QStringLiteral("xhttp-opts.download-settings.reality-opts.");
+                QString publicKey;
+                if (settings.reality_opts) {
+                    publicKey = ImportRealityPublicKey(qs(downloadReality.public_key), at + "public-key");
+                    if (const auto message = Checks::RealityPublicKey(publicKey, true); !message.isEmpty()) ParseDiag::Error(at + "public-key", message);
+                    if (const auto message = Checks::RealityShortId(qs(downloadReality.short_id).trimmed()); !message.isEmpty()) ParseDiag::Error(at + "short-id", message);
+                } else {
+                    // The upload leg has already reported and checked the key it lends.
+                    ParseDiag::Scope reported;
+                    publicKey = ImportRealityPublicKey(qs(downloadReality.public_key), at + "public-key");
+                }
+                reality["publicKey"] = publicKey;
+                if (const auto shortId = qs(downloadReality.short_id).trimmed(); !shortId.isEmpty()) reality["shortId"] = shortId;
                 object["realitySettings"] = reality;
-            } else if (settings.tls) {
+            } else if (settings.tls.value_or(proxy.tls)) {
                 object["security"] = "tls";
                 QJsonObject tls;
-                if (hasText(settings.servername)) tls["serverName"] = toAceHost(qs(settings.servername));
-                if (!settings.alpn.empty()) {
-                    QJsonArray alpn;
-                    for (const auto& item : settings.alpn) alpn.append(qs(item));
-                    tls["alpn"] = alpn;
+                if (!serverName.isEmpty()) tls["serverName"] = toAceHost(serverName);
+                QJsonArray alpn;
+                for (const auto& item : settings.alpn.value_or(proxy.alpn)) {
+                    if (const auto protocol = qs(item).trimmed(); !protocol.isEmpty()) alpn.append(protocol);
                 }
-                if (hasText(settings.client_fingerprint)) tls["fingerprint"] = qs(settings.client_fingerprint);
+                if (!alpn.isEmpty()) tls["alpn"] = alpn;
+                if (IsClashNoFingerprint(clientFingerprint)) {
+                    tls["fingerprint"] = tlsUnsafeFingerprint;
+                } else if (const auto fingerprint = knownFingerprint(false); !fingerprint.isEmpty()) {
+                    tls["fingerprint"] = fingerprint;
+                }
+                if (const auto pin = qs(settings.fingerprint.value_or(proxy.fingerprint)).trimmed(); !pin.isEmpty()) {
+                    tls["pinnedPeerCertSha256"] = pin;
+                    // An inherited pin on a TLS upload leg is already checked there by Validate.
+                    const bool uploadPinned = proxy.tls && !uploadReality;
+                    if (const auto message = Checks::XrayPinnedSha256(pin); !message.isEmpty() && (settings.fingerprint || !uploadPinned)) {
+                        ParseDiag::Error(settings.fingerprint ? "xhttp-opts.download-settings.fingerprint" : "fingerprint", message);
+                    }
+                }
                 object["tlsSettings"] = tls;
             }
 
             QJsonObject xhttp;
-            if (hasText(settings.host)) xhttp["host"] = toAceHost(qs(settings.host));
-            if (hasText(settings.path)) xhttp["path"] = qs(settings.path);
+            if (const auto host = qs(settings.host.value_or(proxy.xhttp_opts.host)); !host.isEmpty()) xhttp["host"] = toAceHost(host);
+            if (const auto path = qs(settings.path.value_or(proxy.xhttp_opts.path)); !path.isEmpty()) xhttp["path"] = path;
             xhttp["mode"] = hasText(settings.mode) ? qs(settings.mode) : "auto";
 
-            QJsonObject extra;
+            extra.remove("downloadSettings");
+            if (settings.headers) {
+                QJsonObject headers;
+                for (const auto& [key, value] : *settings.headers) {
+                    // Xray refuses a Host header; it is the host field.
+                    if (qs(key).compare(QLatin1String("host"), Qt::CaseInsensitive) != 0) headers[qs(key)] = qs(value);
+                    else if (!xhttp.contains("host") && hasText(value)) xhttp["host"] = toAceHost(qs(value));
+                }
+                if (headers.isEmpty()) extra.remove("headers");
+                else extra["headers"] = headers;
+            }
             addXPaddingFields(extra, settings.x_padding_obfs_mode, settings.x_padding_key,
                               settings.x_padding_header, settings.x_padding_placement,
                               settings.x_padding_method);
@@ -163,12 +486,92 @@ namespace Configs {
             if (object.contains(key)) target = object[key].toString();
         }
 
-        void parseVariantString(const QJsonObject& object, const QString& key, QString& target) {
-            if (object.contains(key)) target = object[key].toVariant().toString();
+        // Xray reads a range as "a-b" or a number; sing-box forks also write {"from": a, "to": b}.
+        void parseRange(const QJsonObject& object, const QString& key, QString& target) {
+            if (!object.contains(key)) return;
+            const auto value = object[key];
+            if (!value.isObject()) {
+                target = value.toVariant().toString();
+                return;
+            }
+            const auto from = value.toObject().value("from").toVariant().toString();
+            const auto to = value.toObject().value("to").toVariant().toString();
+            if (from.isEmpty() || to.isEmpty() || from == to) target = from.isEmpty() ? to : from;
+            else target = from + QLatin1Char('-') + to;
+        }
+
+        QString foldXHTTPKey(const QString& key) {
+            QString folded;
+            for (const auto c : key) {
+                if (c != QLatin1Char('_') && c != QLatin1Char('-')) folded += c.toLower();
+            }
+            return folded;
+        }
+
+        // Go folds case, and sing-box forks write snake_case: every spelling becomes Xray's name, an exact one outranking a case-folded one, then an underscored one.
+        QJsonObject canonicalXHTTPKeys(const QJsonObject& obj, const QStringList& known) {
+            QJsonObject result;
+            QHash<QString, int> rank;
+            for (auto it = obj.constBegin(); it != obj.constEnd(); ++it) {
+                const auto folded = foldXHTTPKey(it.key());
+                const auto match = std::find_if(known.cbegin(), known.cend(), [&](const QString& name) { return foldXHTTPKey(name) == folded; });
+                if (match == known.cend()) {
+                    result.insert(it.key(), it.value());
+                    continue;
+                }
+                const int r = it.key() == *match ? 2 : it.key().compare(*match, Qt::CaseInsensitive) == 0 ? 1 : 0;
+                if (rank.value(*match, -1) > r) continue;
+                rank.insert(*match, r);
+                result.insert(*match, it.value());
+            }
+            return result;
+        }
+
+        // A Python dict repr (str() instead of json.dumps): quotes and True/False/None are rewritten outside strings only.
+        QString pythonReprToJson(const QString& text) {
+            QString out;
+            out.reserve(text.size());
+            QChar quote;
+            for (qsizetype i = 0; i < text.size(); ++i) {
+                const QChar c = text.at(i);
+                if (!quote.isNull()) {
+                    if (c == QLatin1Char('\\') && i + 1 < text.size()) {
+                        const QChar next = text.at(++i);
+                        if (next != QLatin1Char('\'')) out += c;
+                        out += next;
+                    } else if (c == quote) {
+                        out += QLatin1Char('"');
+                        quote = QChar();
+                    } else {
+                        if (c == QLatin1Char('"')) out += QLatin1Char('\\');
+                        out += c;
+                    }
+                } else if (c == QLatin1Char('\'') || c == QLatin1Char('"')) {
+                    quote = c;
+                    out += QLatin1Char('"');
+                } else if (c.isLetter()) {
+                    auto end = i;
+                    while (end < text.size() && (text.at(end).isLetterOrNumber() || text.at(end) == QLatin1Char('_'))) ++end;
+                    const auto word = text.mid(i, end - i);
+                    if (word == QLatin1String("True")) out += QLatin1String("true");
+                    else if (word == QLatin1String("False")) out += QLatin1String("false");
+                    else if (word == QLatin1String("None")) out += QLatin1String("null");
+                    else out += word;
+                    i = end - 1;
+                } else {
+                    out += c;
+                }
+            }
+            return out;
         }
 
         void parseBool(const QJsonObject& object, const QString& key, bool& target) {
-            if (object.contains(key)) target = object[key].toBool();
+            if (!object.contains(key)) return;
+            const auto value = object[key];
+            // Loose generators write 1 or "true"; Xray would refuse either.
+            if (value.isDouble()) target = value.toDouble() != 0;
+            else if (value.isString()) target = value.toString().trimmed().compare(QLatin1String("true"), Qt::CaseInsensitive) == 0 || value.toString().trimmed() == QLatin1String("1");
+            else target = value.toBool();
         }
 
         void parseLongLong(const QJsonObject& object, const QString& key, long long& target) {
@@ -179,21 +582,56 @@ namespace Configs {
             if (object.contains(key)) target = object[key].toVariant().toInt();
         }
 
-        void parseXHTTPXmuxObject(xrayXHTTP* config, const QJsonObject& obj) {
+        void parseXHTTPXmuxObject(xrayXHTTP* config, const QJsonObject& source) {
+            const auto obj = canonicalXHTTPKeys(source, knownXHTTPXmuxKeys());
             for (const auto& key : obj.keys()) {
                 if (!knownXHTTPXmuxKeys().contains(key)) {
                     config->rawXmux[key] = obj[key];
                 }
             }
-            parseVariantString(obj, "maxConcurrency", config->maxConcurrency);
-            parseVariantString(obj, "maxConnections", config->maxConnections);
-            parseVariantString(obj, "cMaxReuseTimes", config->cMaxReuseTimes);
-            parseVariantString(obj, "hMaxRequestTimes", config->hMaxRequestTimes);
-            parseVariantString(obj, "hMaxReusableSecs", config->hMaxReusableSecs);
+            parseRange(obj, "maxConcurrency", config->maxConcurrency);
+            parseRange(obj, "maxConnections", config->maxConnections);
+            parseRange(obj, "cMaxReuseTimes", config->cMaxReuseTimes);
+            parseRange(obj, "hMaxRequestTimes", config->hMaxRequestTimes);
+            parseRange(obj, "hMaxReusableSecs", config->hMaxReusableSecs);
             parseLongLong(obj, "hKeepAlivePeriod", config->hKeepAlivePeriod);
         }
 
-        void parseXHTTPExtraObject(xrayXHTTP* config, const QJsonObject& obj) {
+        // Links carry headers as name|value|name|value.
+        QStringList linkHeaders(const QUrlQuery& query) {
+            const auto raw = query.queryItemValue("headers", QUrl::FullyDecoded);
+            if (raw.isEmpty()) return {};
+            auto headers = raw.split('|');
+            if (headers.size() % 2 == 0) return headers;
+            ParseDiag::Warn("headers", QCoreApplication::translate("Validation", "The headers must alternate names and values separated by |, for example User-Agent|curl, so they were ignored."));
+            return {};
+        }
+
+        // Host goes to the host field: Xray httpupgrade refuses it inside headers, ws deprecates it there.
+        QString clashWsHeaders(const std::map<std::string, std::string>& source, QStringList& headers) {
+            QString host;
+            for (const auto& [key, value] : source) {
+                const auto name = QString::fromStdString(key);
+                if (name.compare(QLatin1String("host"), Qt::CaseInsensitive) == 0) {
+                    if (host.isEmpty()) host = QString::fromStdString(value);
+                    continue;
+                }
+                headers << name << QString::fromStdString(value);
+            }
+            return host;
+        }
+
+        void warnUnparsableExtra(const QString& value) {
+            const auto trimmed = value.trimmed();
+            if (trimmed.isEmpty()) return;
+            QJsonParseError err;
+            if (const auto doc = QJsonDocument::fromJson(trimmed.toUtf8(), &err);
+                err.error == QJsonParseError::NoError && doc.isObject() && doc.object().isEmpty()) return;
+            ParseDiag::Warn("extra", QCoreApplication::translate("Validation", "The extra value is not a valid JSON object, so it was ignored."));
+        }
+
+        void parseXHTTPExtraObject(xrayXHTTP* config, const QJsonObject& source) {
+            const auto obj = canonicalXHTTPKeys(source, knownXHTTPExtraKeys());
             for (const auto& key : obj.keys()) {
                 if (!knownXHTTPExtraKeys().contains(key)) {
                     config->rawExtra[key] = obj[key];
@@ -207,7 +645,7 @@ namespace Configs {
                     config->headers = QJsonArray2QListString(obj["headers"].toArray());
                 }
             }
-            parseVariantString(obj, "xPaddingBytes", config->xPaddingBytes);
+            parseRange(obj, "xPaddingBytes", config->xPaddingBytes);
             parseBool(obj, "xPaddingObfsMode", config->xPaddingObfsMode);
             parseString(obj, "xPaddingKey", config->xPaddingKey);
             parseString(obj, "xPaddingHeader", config->xPaddingHeader);
@@ -219,18 +657,18 @@ namespace Configs {
             parseString(obj, "sessionKey", config->sessionIDKey); // legacy alias (pre-v26.6.22 Xray)
             parseString(obj, "sessionIDKey", config->sessionIDKey);
             parseString(obj, "sessionIDTable", config->sessionIDTable);
-            parseVariantString(obj, "sessionIDLength", config->sessionIDLength);
+            parseRange(obj, "sessionIDLength", config->sessionIDLength);
             parseString(obj, "seqPlacement", config->seqPlacement);
             parseString(obj, "seqKey", config->seqKey);
             parseString(obj, "uplinkDataPlacement", config->uplinkDataPlacement);
             parseString(obj, "uplinkDataKey", config->uplinkDataKey);
-            parseVariantString(obj, "uplinkChunkSize", config->uplinkChunkSize);
+            parseRange(obj, "uplinkChunkSize", config->uplinkChunkSize);
             parseBool(obj, "noGRPCHeader", config->noGRPCHeader);
             parseBool(obj, "noSSEHeader", config->noSSEHeader);
-            parseVariantString(obj, "scMaxEachPostBytes", config->scMaxEachPostBytes);
-            parseVariantString(obj, "scMinPostsIntervalMs", config->scMinPostsIntervalMs);
+            parseRange(obj, "scMaxEachPostBytes", config->scMaxEachPostBytes);
+            parseRange(obj, "scMinPostsIntervalMs", config->scMinPostsIntervalMs);
             parseLongLong(obj, "scMaxBufferedPosts", config->scMaxBufferedPosts);
-            parseVariantString(obj, "scStreamUpServerSecs", config->scStreamUpServerSecs);
+            parseRange(obj, "scStreamUpServerSecs", config->scStreamUpServerSecs);
             parseInt(obj, "serverMaxHeaderBytes", config->serverMaxHeaderBytes);
             if (obj.contains("downloadSettings")) {
                 if (obj["downloadSettings"].isObject()) {
@@ -243,6 +681,589 @@ namespace Configs {
                 parseXHTTPXmuxObject(config, xmuxObj);
             }
         }
+
+        // Xray refuses these at start but picks its own default for an empty one.
+        void dropUnusableXHTTPValues(xrayXHTTP& x) {
+            const auto drop = [](const QString& field, const QString& message, QString& value) {
+                if (!AcceptOptional(field, message, value)) value.clear();
+            };
+            if (!AcceptOptional("mode", Checks::XrayXHTTPMode(x.mode), x.mode)) x.mode = "auto";
+            // Xray refuses a Host header, which the host field outranks anyway.
+            for (qsizetype i = 0; i + 1 < x.headers.size();) {
+                if (x.headers[i].trimmed().compare(QLatin1String("host"), Qt::CaseInsensitive) != 0) {
+                    i += 2;
+                    continue;
+                }
+                if (x.host.isEmpty()) x.host = toAceHost(x.headers[i + 1].trimmed());
+                x.headers.remove(i, 2);
+            }
+            drop("xPaddingBytes", Checks::XrayXPaddingBytes(x.xPaddingBytes), x.xPaddingBytes);
+            drop("xPaddingMethod", Checks::XrayPaddingMethod(x.xPaddingMethod), x.xPaddingMethod);
+            drop("xPaddingPlacement", Checks::XrayPaddingPlacement(x.xPaddingPlacement), x.xPaddingPlacement);
+            drop("uplinkDataPlacement", Validation::OneOf(x.uplinkDataPlacement, XrayXHTTPUplinkDataPlacements), x.uplinkDataPlacement);
+            drop("sessionIDPlacement", Checks::XrayMetaPlacement(x.sessionIDPlacement), x.sessionIDPlacement);
+            drop("seqPlacement", Checks::XrayMetaPlacement(x.seqPlacement), x.seqPlacement);
+            for (const auto& [name, field] : {std::pair{"sessionIDLength", &xrayXHTTP::sessionIDLength},
+                                              std::pair{"uplinkChunkSize", &xrayXHTTP::uplinkChunkSize},
+                                              std::pair{"scMaxEachPostBytes", &xrayXHTTP::scMaxEachPostBytes},
+                                              std::pair{"scMinPostsIntervalMs", &xrayXHTTP::scMinPostsIntervalMs},
+                                              std::pair{"scStreamUpServerSecs", &xrayXHTTP::scStreamUpServerSecs},
+                                              std::pair{"xmux.maxConcurrency", &xrayXHTTP::maxConcurrency},
+                                              std::pair{"xmux.maxConnections", &xrayXHTTP::maxConnections},
+                                              std::pair{"xmux.cMaxReuseTimes", &xrayXHTTP::cMaxReuseTimes},
+                                              std::pair{"xmux.hMaxRequestTimes", &xrayXHTTP::hMaxRequestTimes},
+                                              std::pair{"xmux.hMaxReusableSecs", &xrayXHTTP::hMaxReusableSecs}}) {
+                drop(name, Checks::XrayInt32Range(x.*field), x.*field);
+            }
+        }
+
+        struct XrayKCPValue {
+            const char* key;
+            qint64 xrayKCP::*field;
+        };
+
+        constexpr std::array<XrayKCPValue, 6> kXrayKCPValues = {{
+            {"mtu", &xrayKCP::mtu},
+            {"tti", &xrayKCP::tti},
+            {"uplinkCapacity", &xrayKCP::uplinkCapacity},
+            {"downlinkCapacity", &xrayKCP::downlinkCapacity},
+            {"cwndMultiplier", &xrayKCP::cwndMultiplier},
+            {"maxSendingWindow", &xrayKCP::maxSendingWindow},
+        }};
+
+        QString xrayKCPCheck(const QString& key, const QString& text, qint64 mtu)
+        {
+            if (key == QLatin1String("mtu")) return Checks::XrayKCPMtu(text);
+            if (key == QLatin1String("tti")) return Checks::XrayKCPTti(text);
+            if (key == QLatin1String("cwndMultiplier")) return Checks::XrayKCPCwndMultiplier(text);
+            if (key == QLatin1String("maxSendingWindow")) return Checks::XrayKCPMaxSendingWindow(text, QString::number(mtu));
+            return Checks::XrayKCPCapacity(text);
+        }
+
+        // Whole JSON numbers as Validation::Int reads them; null and other non-numbers keep Xray's default.
+        QString xrayKCPJsonText(const QJsonValue& value)
+        {
+            if (value.isString()) return value.toString().trimmed();
+            if (!value.isDouble()) return {};
+            const double number = value.toDouble();
+            if (std::abs(number) < 1e15 && number == std::floor(number)) return QString::number(static_cast<qint64>(number));
+            return QString::number(number);
+        }
+
+        QJsonValue xrayStreamValue(QJsonObject object, const QString& name, bool pointer)
+        {
+            return xrayStreamLast(xrayStreamRoot(object), name, pointer);
+        }
+
+        QString xrayMaskType(const QJsonValue& mask)
+        {
+            return XrayLower(xrayStreamValue(mask.toObject(), QStringLiteral("type"), false).toString());
+        }
+
+        // Go reads a mask's keys case-insensitively, and LoadWithID lower-cases its type.
+        bool xrayCanonicalMask(QJsonObject& mask)
+        {
+            const auto original = mask;
+            const auto type = xrayStreamValue(mask, QStringLiteral("type"), false);
+            const auto settings = xrayStreamValue(mask, QStringLiteral("settings"), true);
+            xrayStreamRemoveNamed(mask, QStringLiteral("type"));
+            xrayStreamRemoveNamed(mask, QStringLiteral("settings"));
+            if (!type.isUndefined()) mask["type"] = type.isString() ? QJsonValue(XrayLower(type.toString())) : type;
+            if (!settings.isUndefined() && !settings.isNull()) mask["settings"] = settings;
+            return mask != original;
+        }
+
+        // Xray 26.5.29 folded these into mkcp-legacy and dropped the names. An empty AES password has no mkcp-legacy form.
+        bool xrayUpgradeMkcpMask(QJsonObject& mask)
+        {
+            static const QStringList headers = {"dns", "dtls", "srtp", "utp", "wechat", "wireguard"};
+            const auto type = mask.value("type").toString();
+            const auto settings = mask.value("settings").toObject();
+            QJsonObject legacy;
+            if (type == "mkcp-aes128gcm") {
+                const auto password = xrayStreamValue(settings, QStringLiteral("password"), false).toString();
+                if (password.isEmpty()) return false;
+                legacy["value"] = password;
+            } else if (type.startsWith("header-") && headers.contains(type.mid(7))) {
+                legacy["header"] = type.mid(7);
+                const auto domain = xrayStreamValue(settings, QStringLiteral("domain"), false).toString();
+                if (type == "header-dns" && !domain.isEmpty()) legacy["value"] = domain;
+            } else if (type != "mkcp-original") {
+                return false;
+            }
+            mask = QJsonObject{{"type", "mkcp-legacy"}};
+            if (!legacy.isEmpty()) mask["settings"] = legacy;
+            return true;
+        }
+
+        // The "name[:txt|a|aaaa]" spec of the pre-26.9.30 xdns lists, which always queried with a 1232-byte EDNS0 payload.
+        bool xrayLegacyXdnsDomain(const QString& spec, QJsonObject& domain)
+        {
+            static const QHash<QString, int> types = {{"", 16}, {"txt", 16}, {"a", 1}, {"aaaa", 28}};
+            auto name = spec.trimmed();
+            QString method;
+            if (const auto colon = name.lastIndexOf(':'); colon >= 0) {
+                method = name.mid(colon + 1).toLower();
+                name = name.left(colon);
+            }
+            while (name.startsWith('.')) name.remove(0, 1);
+            while (name.endsWith('.')) name.chop(1);
+            if (name.isEmpty() || !types.contains(method)) return false;
+            domain = QJsonObject{{"names", QJsonArray{name}}, {"types", QJsonArray{types.value(method)}}, {"edns0", 1232}};
+            return true;
+        }
+
+        // 3x-ui's maskcompat.UpgradeLegacyXdns: Xray 26.10.5 refuses the string lists and silently ignores 26.9.30's objects.
+        bool xrayUpgradeXdnsSettings(QJsonObject& settings)
+        {
+            const auto rawDomains = settings.value("domains").toArray();
+            const auto rawResolvers = settings.value("resolvers").toArray();
+            const auto legacyDomain = [](const QJsonValue& v) { return v.isString() || v.toObject().contains("name"); };
+            const auto legacyResolver = [](const QJsonValue& v) { return v.isString() || (v.isObject() && !v.toObject().contains("addrs")); };
+            bool legacy = false;
+            for (const auto& entry : rawDomains) legacy = legacy || legacyDomain(entry);
+            for (const auto& entry : rawResolvers) legacy = legacy || legacyResolver(entry);
+            if (!legacy) return false;
+
+            QJsonArray domains;
+            QSet<QString> listed;
+            const auto addDomain = [&](const QJsonObject& domain) {
+                for (const auto& name : domain.value("names").toArray()) {
+                    if (name.isString()) listed.insert(XrayLower(name.toString()));
+                }
+                domains.append(domain);
+            };
+            const auto addLegacyDomain = [&](const QJsonObject& domain) {
+                if (!listed.contains(XrayLower(domain.value("names").toArray().first().toString()))) addDomain(domain);
+            };
+            for (const auto& entry : rawDomains) {
+                if (entry.isObject()) {
+                    auto domain = entry.toObject();
+                    if (domain.contains("name")) {
+                        const auto name = domain.take("name").toString().trimmed();
+                        auto names = domain.value("names").toArray();
+                        if (!name.isEmpty() && !names.contains(name)) names.prepend(name);
+                        domain["names"] = names;
+                    }
+                    addDomain(domain);
+                } else if (QJsonObject domain; entry.isString() && xrayLegacyXdnsDomain(entry.toString(), domain)) {
+                    addLegacyDomain(domain);
+                }
+            }
+            QJsonArray resolvers;
+            for (const auto& entry : rawResolvers) {
+                if (entry.isString()) {
+                    const auto text = entry.toString();
+                    const auto cut = text.indexOf(QLatin1String("+udp://"));
+                    const auto addr = cut < 0 ? QString() : text.mid(cut + 7).trimmed();
+                    QJsonObject domain;
+                    if (addr.isEmpty() || !xrayLegacyXdnsDomain(text.left(cut), domain)) continue;
+                    addLegacyDomain(domain);
+                    resolvers.append(QJsonObject{{"addrs", QJsonArray{"udp://" + addr}}});
+                } else if (entry.isObject() && legacyResolver(entry)) {
+                    const auto resolver = entry.toObject();
+                    const auto kind = resolver.value("type").toString().trimmed().toLower();
+                    const auto addr = resolver.value("settings").toObject().value("addr").toString().trimmed();
+                    if ((kind == "udp" || kind == "tcp") && !addr.isEmpty()) resolvers.append(QJsonObject{{"addrs", QJsonArray{kind + "://" + addr}}});
+                } else {
+                    resolvers.append(entry);
+                }
+            }
+            settings["domains"] = domains;
+            if (resolvers.isEmpty()) settings.remove("resolvers");
+            else settings["resolvers"] = resolvers;
+            return true;
+        }
+
+        // The mKCP header types links and kcpSettings carried before finalmask; false for one Xray never had.
+        bool xrayKCPLegacyHeader(const QString& type, QString& header)
+        {
+            static const QStringList same = {"dns", "dtls", "srtp", "utp", "wireguard"};
+            const auto t = XrayLower(type.trimmed());
+            header.clear();
+            if (t.isEmpty() || t == "none") return true;
+            if (t == "wechat-video") header = QStringLiteral("wechat");
+            else if (same.contains(t)) header = t;
+            return !header.isEmpty();
+        }
+
+        // Old mKCP ran the seed's AES-128-GCM, else its original obfuscation, inside the header; xdns has to stay the last mask.
+        void xrayKCPLegacyMasks(QJsonObject& finalmask, const QString& header, const QString& domain, const QString& seed)
+        {
+            if (header.isEmpty() && seed.isEmpty()) return;
+            auto udp = finalmask.value("udp").toArray();
+            auto at = udp.size();
+            for (qsizetype i = 0; i < udp.size(); ++i) {
+                const auto type = xrayMaskType(udp.at(i));
+                if (type == "mkcp-legacy") return;
+                if (type == "xdns" && at == udp.size()) at = i;
+            }
+            QJsonObject cipher{{"type", "mkcp-legacy"}};
+            if (!seed.isEmpty()) cipher["settings"] = QJsonObject{{"value", seed}};
+            udp.insert(at++, cipher);
+            if (!header.isEmpty()) {
+                QJsonObject settings{{"header", header}};
+                if (!domain.isEmpty()) settings["value"] = domain;
+                udp.insert(at, QJsonObject{{"type", "mkcp-legacy"}, {"settings", settings}});
+            }
+            finalmask["udp"] = udp;
+        }
+
+        void xrayKCPImportLegacy(QJsonObject& finalmask, const QString& field, const QString& type, const QString& domain, const QString& seed)
+        {
+            QString header;
+            if (!xrayKCPLegacyHeader(type, header)) {
+                ParseDiag::Warn(field, QCoreApplication::translate("Validation", "Xray does not know the mKCP header type \"%1\", so it was ignored.").arg(type.trimmed()), type);
+            }
+            xrayKCPLegacyMasks(finalmask, header, header == "dns" ? domain : QString(), seed);
+        }
+
+        // filter only screens a listener's sources, and a client core older than Xray 26.10.21 refuses the type.
+        QJsonObject xrayShareFinalmask(QJsonObject finalmask)
+        {
+            for (const auto& layer : {QStringLiteral("tcp"), QStringLiteral("udp")}) {
+                for (const auto& key : xrayStreamKeysNamed(finalmask, layer)) {
+                    if (!finalmask.value(key).isArray()) continue;
+                    QJsonArray kept;
+                    for (const auto& mask : finalmask.value(key).toArray()) {
+                        if (xrayMaskType(mask) != "filter") kept.append(mask);
+                    }
+                    if (kept.isEmpty()) finalmask.remove(key);
+                    else finalmask[key] = kept;
+                }
+            }
+            return finalmask;
+        }
+
+        QStringList xrayXdnsNames(const QJsonObject& settings)
+        {
+            QStringList names;
+            for (const auto& domain : xrayStreamValue(settings, QStringLiteral("domains"), true).toArray()) {
+                for (const auto& name : xrayStreamValue(domain.toObject(), QStringLiteral("names"), true).toArray()) {
+                    if (const auto text = name.toString().trimmed(); !text.isEmpty()) names << text;
+                }
+            }
+            return names;
+        }
+
+        void xrayXdnsIssues(Validation::Issues& issues, const QString& at, const QJsonObject& mask, bool resolversReplaced)
+        {
+            using Validation::Severity;
+            auto copy = mask;
+            QString settingsAt = at + "settings";
+            const auto settings = xrayStreamLast(xrayStreamRoot(copy, at), QStringLiteral("settings"), true, &settingsAt).toObject();
+            const QString base = settingsAt + QLatin1Char('.');
+            if (xrayXdnsNames(settings).isEmpty()) {
+                xrayStreamAdd(issues, Severity::Error, base + "domains",
+                              QCoreApplication::translate("Validation", "Add the tunnel domain the server answers for, for example \"domains\": [{\"names\": [\"t.example.com\"]}]."));
+            }
+            bool resolved = false;
+            const auto resolvers = xrayStreamValue(settings, QStringLiteral("resolvers"), true).toArray();
+            for (qsizetype i = 0; i < resolvers.size(); ++i) {
+                const auto resolver = resolvers.at(i).toObject();
+                const auto resolverAt = QStringLiteral("%1resolvers[%2].").arg(base).arg(i);
+                bool doh = false;
+                for (const auto& addr : xrayStreamValue(resolver, QStringLiteral("addrs"), true).toArray()) {
+                    const auto text = addr.toString().trimmed();
+                    if (text.isEmpty()) continue;
+                    resolved = true;
+                    const auto scheme = text.contains(QLatin1String("://")) ? text.left(text.indexOf(QLatin1String("://"))).toLower() : QStringLiteral("udp");
+                    doh = doh || scheme == "https";
+                    if (scheme != "udp" && scheme != "tcp" && scheme != "https") {
+                        xrayStreamAdd(issues, Severity::Error, resolverAt + "addrs",
+                                      QCoreApplication::translate("Validation", "Use udp://, tcp:// or https:// resolver addresses."), text);
+                    }
+                }
+                if (!doh) continue;
+                const auto tls = xrayStreamValue(resolver, QStringLiteral("tlsConfig"), true);
+                if (!tls.isObject()) {
+                    xrayStreamAdd(issues, Severity::Error, resolverAt + "tlsConfig",
+                                  QCoreApplication::translate("Validation", "A DoH resolver needs \"tlsConfig\", for example \"tlsConfig\": {\"serverName\": \"dns.google\"}."));
+                    continue;
+                }
+                const auto tlsConfig = tls.toObject();
+                const auto alpn = xrayStreamValue(tlsConfig, QStringLiteral("alpn"), true);
+                const bool h3 = alpn.isString() ? alpn.toString() == "h3" : alpn.toArray() == QJsonArray{"h3"};
+                if (h3) {
+                    const auto quic = xrayStreamValue(resolver, QStringLiteral("quicConfig"), true).toObject();
+                    if (XrayLower(xrayStreamValue(quic, QStringLiteral("congestion"), false).toString()) == "brutal") {
+                        xrayStreamAdd(issues, Severity::Error, resolverAt + "quicConfig.congestion",
+                                      QCoreApplication::translate("Validation", "Over h3 the brutal congestion control crashes Xray; use bbr, reno or force-brutal."));
+                    }
+                    continue;
+                }
+                const auto text = [&](const char* name) { return xrayStreamValue(tlsConfig, QLatin1String(name), false).toString().trimmed(); };
+                if (text("serverName").isEmpty() && text("pinnedPeerCertSha256").isEmpty() && text("verifyPeerCertByName").isEmpty()
+                    && !xrayStreamValue(tlsConfig, QStringLiteral("allowInsecure"), false).toBool()) {
+                    xrayStreamAdd(issues, Severity::Warning, resolverAt + "tlsConfig.serverName",
+                                  QCoreApplication::translate("Validation", "Set \"serverName\" in tlsConfig: over HTTP/2 Xray does not take it from the URL, so the TLS handshake fails."));
+                }
+            }
+            if (!resolved && !resolversReplaced) {
+                xrayStreamAdd(issues, Severity::Warning, base + "resolvers",
+                              QCoreApplication::translate("Validation", "Add a DNS resolver to send the tunnel's queries through, for example \"resolvers\": [{\"addrs\": [\"udp://8.8.8.8:53\"]}]; without one Xray cannot connect."));
+            }
+        }
+
+        bool xrayStripResolverKeyLog(QJsonObject& resolver, const QString& at, Validation::Issues& issues)
+        {
+            bool removed = false;
+            for (const auto& tlsKey : xrayStreamKeysNamed(resolver, QStringLiteral("tlsConfig"))) {
+                if (!resolver.value(tlsKey).isObject()) continue;
+                auto tls = resolver.value(tlsKey).toObject();
+                bool changed = false;
+                for (const auto& key : xrayStreamKeysNamed(tls, QStringLiteral("masterKeyLog"))) {
+                    const auto path = tls.value(key).toString().trimmed();
+                    // Xray reads "none" as no file.
+                    if (path.isEmpty() || path == "none") continue;
+                    issues << Validation::Issue{Validation::Severity::Warning, at + tlsKey + QLatin1Char('.') + key,
+                                                QCoreApplication::translate("Validation", "Removed from the imported configuration: it would write a file on this computer at a path the sender chose."),
+                                                path};
+                    tls.remove(key);
+                    changed = true;
+                }
+                if (!changed) continue;
+                resolver[tlsKey] = tls;
+                removed = true;
+            }
+            return removed;
+        }
+
+        // A DoH address keeps the settings of the mask resolver that listed it, else gets the serverName Xray's DoH dialer needs.
+        QJsonArray xrayXdnsSourcedResolvers(const QJsonObject& settings, const QJsonArray& addresses)
+        {
+            QHash<QString, QJsonObject> known;
+            for (const auto& entry : xrayStreamValue(settings, QStringLiteral("resolvers"), true).toArray()) {
+                auto resolver = entry.toObject();
+                const auto addrs = xrayStreamValue(resolver, QStringLiteral("addrs"), true).toArray();
+                xrayStreamRemoveNamed(resolver, QStringLiteral("addrs"));
+                for (const auto& addr : addrs) {
+                    if (const auto key = XdnsResolverAddress(addr.toString()); !key.isEmpty() && !known.contains(key)) known.insert(key, resolver);
+                }
+            }
+            QJsonArray plain;
+            QJsonArray resolvers;
+            for (const auto& value : addresses) {
+                const auto address = value.toString();
+                if (!address.startsWith(QLatin1String("https://"))) {
+                    plain.append(address);
+                    continue;
+                }
+                auto resolver = known.value(address, QJsonObject{{"tlsConfig", QJsonObject{{"serverName", QUrl(address).host(QUrl::EncodeUnicode)}}}});
+                resolver["addrs"] = QJsonArray{address};
+                resolvers.append(resolver);
+            }
+            if (!plain.isEmpty()) resolvers.prepend(QJsonObject{{"addrs", plain}});
+            return resolvers;
+        }
+
+        void xrayXdnsReplaceResolvers(QJsonObject& finalmask, const QJsonArray& addresses)
+        {
+            for (const auto& layerKey : xrayStreamKeysNamed(finalmask, QStringLiteral("udp"))) {
+                if (!finalmask.value(layerKey).isArray()) continue;
+                auto masks = finalmask.value(layerKey).toArray();
+                for (qsizetype i = 0; i < masks.size(); ++i) {
+                    if (xrayMaskType(masks.at(i)) != "xdns") continue;
+                    auto mask = masks.at(i).toObject();
+                    auto settings = xrayStreamValue(mask, QStringLiteral("settings"), true).toObject();
+                    const auto resolvers = xrayXdnsSourcedResolvers(settings, addresses);
+                    xrayStreamRemoveNamed(settings, QStringLiteral("resolvers"));
+                    settings["resolvers"] = resolvers;
+                    xrayStreamRemoveNamed(mask, QStringLiteral("settings"));
+                    mask["settings"] = settings;
+                    masks[i] = mask;
+                }
+                finalmask[layerKey] = masks;
+            }
+        }
+    }
+
+    QString NormalizeXrayNetwork(const QString& network) {
+        const auto lower = network.toLower();
+        if (lower == "tcp") return "raw";
+        if (lower == "splithttp") return "xhttp";
+        if (lower == "websocket") return "ws";
+        if (lower == "mkcp") return "kcp";
+        return lower;
+    }
+
+    bool UpgradeXrayFinalmask(QJsonObject& finalmask)
+    {
+        bool changed = false;
+        for (const auto& layer : {QStringLiteral("tcp"), QStringLiteral("udp")}) {
+            const auto keys = xrayStreamKeysNamed(finalmask, layer);
+            if (keys.isEmpty()) continue;
+            if (keys != QStringList{layer}) {
+                const auto value = xrayStreamValue(finalmask, layer, true);
+                xrayStreamRemoveNamed(finalmask, layer);
+                if (!value.isNull()) finalmask.insert(layer, value);
+                changed = true;
+            }
+            if (!finalmask.value(layer).isArray()) continue;
+            auto masks = finalmask.value(layer).toArray();
+            bool edited = false;
+            for (qsizetype i = 0; i < masks.size(); ++i) {
+                if (!masks.at(i).isObject()) continue;
+                auto mask = masks.at(i).toObject();
+                bool maskChanged = xrayCanonicalMask(mask);
+                if (layer == QLatin1String("udp")) {
+                    maskChanged |= xrayUpgradeMkcpMask(mask);
+                    if (mask.value("type").toString() == "xdns" && mask.value("settings").isObject()) {
+                        auto settings = mask.value("settings").toObject();
+                        if (xrayUpgradeXdnsSettings(settings)) {
+                            mask["settings"] = settings;
+                            maskChanged = true;
+                        }
+                    }
+                }
+                if (!maskChanged) continue;
+                masks[i] = mask;
+                edited = true;
+            }
+            if (!edited) continue;
+            finalmask[layer] = masks;
+            changed = true;
+        }
+        return changed;
+    }
+
+    bool StripXrayFinalmaskKeyLog(QJsonObject& finalmask, const QString& at, Validation::Issues& issues)
+    {
+        bool removed = false;
+        for (const auto& layerKey : xrayStreamKeysNamed(finalmask, QStringLiteral("udp"))) {
+            if (!finalmask.value(layerKey).isArray()) continue;
+            auto masks = finalmask.value(layerKey).toArray();
+            bool edited = false;
+            for (qsizetype i = 0; i < masks.size(); ++i) {
+                if (xrayMaskType(masks.at(i)) != "xdns") continue;
+                auto mask = masks.at(i).toObject();
+                const auto maskAt = QStringLiteral("%1%2[%3].").arg(at, layerKey).arg(i);
+                bool changed = false;
+                for (const auto& settingsKey : xrayStreamKeysNamed(mask, QStringLiteral("settings"))) {
+                    if (!mask.value(settingsKey).isObject()) continue;
+                    auto settings = mask.value(settingsKey).toObject();
+                    bool settingsChanged = false;
+                    for (const auto& resolversKey : xrayStreamKeysNamed(settings, QStringLiteral("resolvers"))) {
+                        if (!settings.value(resolversKey).isArray()) continue;
+                        auto resolvers = settings.value(resolversKey).toArray();
+                        bool resolversChanged = false;
+                        for (qsizetype j = 0; j < resolvers.size(); ++j) {
+                            auto resolver = resolvers.at(j).toObject();
+                            const auto resolverAt = QStringLiteral("%1%2.%3[%4].").arg(maskAt, settingsKey, resolversKey).arg(j);
+                            if (!xrayStripResolverKeyLog(resolver, resolverAt, issues)) continue;
+                            resolvers[j] = resolver;
+                            resolversChanged = true;
+                        }
+                        if (!resolversChanged) continue;
+                        settings[resolversKey] = resolvers;
+                        settingsChanged = true;
+                    }
+                    if (!settingsChanged) continue;
+                    mask[settingsKey] = settings;
+                    changed = true;
+                }
+                if (!changed) continue;
+                masks[i] = mask;
+                edited = true;
+            }
+            if (!edited) continue;
+            finalmask[layerKey] = masks;
+            removed = true;
+        }
+        return removed;
+    }
+
+    QString XrayLower(const QString& text)
+    {
+        QString lower = text;
+        for (auto& c : lower) {
+            if (c >= u'A' && c <= u'Z') c = QChar(c.unicode() + 32);
+            else if (c == QChar(0x0130)) c = u'i';
+            else if (c == QChar(0x212A)) c = u'k';
+        }
+        return lower;
+    }
+
+    QList<QJsonObject> XrayDownloadLeg(const QJsonObject& outbound)
+    {
+        QList<QJsonObject> leg;
+        auto copy = outbound;
+        xrayStreamEditLive(xrayStreamRoot(copy), QStringLiteral("streamSettings"), false, [&](const QList<XrayStreamNode>& streams) {
+            if (!xrayStreamDialsXHTTP(streams)) return;
+            xrayStreamEditDownloadLeg(streams, [&](const QList<XrayStreamNode>& spellings) {
+                for (const auto& spelling : spellings) leg << *spelling.object;
+            });
+        });
+        return leg;
+    }
+
+    XrayLegProtection XrayDownloadLegProtection(const QList<QJsonObject>& leg, QString& server)
+    {
+        auto spellings = leg;
+        QList<XrayStreamNode> nodes;
+        for (auto& spelling : spellings) nodes.append(XrayStreamNode{&spelling, QString()});
+        server = xrayStreamLast(nodes, QStringLiteral("address"), true).toString();
+        const auto security = XrayLower(xrayStreamLast(nodes, QStringLiteral("security"), false).toString());
+        if (security == "reality") return XrayLegProtection::Verified;
+        if (security != "tls") return XrayLegProtection::Plain;
+        bool insecure = false;
+        bool pinned = false;
+        xrayStreamEditLive(nodes, QStringLiteral("tlsSettings"), false, [&](const QList<XrayStreamNode>& tls) {
+            insecure = xrayStreamLast(tls, QStringLiteral("allowInsecure"), false).toBool();
+            // Xray verifies against a pin or the names it is given even with allowInsecure; it splits both on commas and skips blanks.
+            for (const auto& name : {QStringLiteral("pinnedPeerCertSha256"), QStringLiteral("verifyPeerCertByName")}) {
+                const auto entries = xrayStreamLast(tls, name, false).toString().split(u',');
+                pinned = pinned || std::any_of(entries.cbegin(), entries.cend(), [](const QString& entry) { return !entry.trimmed().isEmpty(); });
+            }
+        });
+        return insecure && !pinned ? XrayLegProtection::Unverified : XrayLegProtection::Verified;
+    }
+
+    void SetXrayDialerProxy(QJsonObject& outbound, const QString& tag)
+    {
+        xrayStreamEditLive(xrayStreamRoot(outbound), QStringLiteral("streamSettings"), true, [&](const QList<XrayStreamNode>& streams) {
+            xrayStreamSetSockopt(streams, QStringLiteral("dialerProxy"), tag);
+            // The download leg dials with its own sockopt unless the main one sets penetrate.
+            xrayStreamEditDownloadLeg(streams, [&](const QList<XrayStreamNode>& leg) {
+                xrayStreamSetSockopt(leg, QStringLiteral("dialerProxy"), tag);
+            });
+        });
+    }
+
+    void BindXrayDownloadLeg(QJsonObject& outbound, const QString& iface)
+    {
+        if (iface.isEmpty()) return;
+        xrayStreamEditLive(xrayStreamRoot(outbound), QStringLiteral("streamSettings"), false, [&](const QList<XrayStreamNode>& streams) {
+            xrayStreamEditDownloadLeg(streams, [&](const QList<XrayStreamNode>& leg) {
+                // A leg that names an interface of its own keeps it.
+                bool pinned = false;
+                xrayStreamEditLive(leg, QStringLiteral("sockopt"), false, [&](const QList<XrayStreamNode>& sockopts) {
+                    pinned = !xrayStreamLast(sockopts, QStringLiteral("interface"), false).toString().isEmpty();
+                });
+                if (!pinned) xrayStreamSetSockopt(leg, QStringLiteral("interface"), iface);
+            });
+        });
+    }
+
+    bool StripXrayDialerState(QJsonObject& stream)
+    {
+        return xrayStreamEditNamed(stream, QStringLiteral("sockopt"), xrayStreamStripDialerKeys);
+    }
+
+    void UseXraySystemCA(QJsonObject& outbound)
+    {
+        // Xray reads tlsSettings only while security is tls.
+        const auto apply = [](const QList<XrayStreamNode>& streams) {
+            if (XrayLower(xrayStreamLast(streams, QStringLiteral("security"), false).toString()) != "tls") return;
+            xrayStreamEditLive(streams, QStringLiteral("tlsSettings"), true, [](const QList<XrayStreamNode>& tls) {
+                if (!xrayStreamLast(tls, QStringLiteral("useSystemCA"), false).isUndefined()) return;
+                tls.last().object->insert(QStringLiteral("useSystemCA"), true);
+            });
+        };
+        xrayStreamEditLive(xrayStreamRoot(outbound), QStringLiteral("streamSettings"), false, [&](const QList<XrayStreamNode>& streams) {
+            apply(streams);
+            xrayStreamEditDownloadLeg(streams, apply);
+        });
     }
 
     bool xrayTLS::ParseFromLink(const QString &link) {
@@ -254,10 +1275,12 @@ namespace Configs {
         if (query.hasQueryItem("peer")) serverName = query.queryItemValue("peer");
         if (query.hasQueryItem("server_name")) serverName = query.queryItemValue("server_name");
         if (query.hasQueryItem("pcs")) pinnedPeerCertSha256 = query.queryItemValue("pcs", QUrl::FullyDecoded);
+        else if (query.hasQueryItem("pinSHA256")) pinnedPeerCertSha256 = query.queryItemValue("pinSHA256", QUrl::FullyDecoded);
         if (query.hasQueryItem("vcn")) verifyPeerCertByName = query.queryItemValue("vcn", QUrl::FullyDecoded);
-        if (query.hasQueryItem("alpn")) alpn = query.queryItemValue("alpn", QUrl::FullyDecoded).split(",");
-        if (query.hasQueryItem("fp")) fingerprint = query.queryItemValue("fp");
-        if (query.hasQueryItem("ech")) echConfigList = query.queryItemValue("ech", QUrl::FullyDecoded);
+        if (query.hasQueryItem("alpn")) alpn = SplitAndTrim(query.queryItemValue("alpn", QUrl::FullyDecoded), ",", false);
+        if (query.hasQueryItem("fp")) fingerprint = xrayStreamKnownFingerprint(query.queryItemValue("fp"), false, "fp");
+        if (query.hasQueryItem("cs")) cipherSuites = splitCipherSuites(query.queryItemValue("cs", QUrl::FullyDecoded)).join(':');
+        if (query.hasQueryItem("ech")) echConfigList = query.queryItemValue("ech", QUrl::FullyDecoded).trimmed();
         return true;
     }
 
@@ -266,9 +1289,20 @@ namespace Configs {
         if (object.contains("serverName")) serverName = object["serverName"].toString();
         if (object.contains("pinnedPeerCertSha256")) pinnedPeerCertSha256 = object["pinnedPeerCertSha256"].toString();
         if (object.contains("verifyPeerCertByName")) verifyPeerCertByName = object["verifyPeerCertByName"].toString();
-        if (object.contains("alpn")) alpn = QJsonArray2QListString(object["alpn"].toArray());
-        if (object.contains("fingerprint")) fingerprint = object["fingerprint"].toString();
+        // ParseFromJson is also the DB loader: only an import normalises or drops values.
+        const bool importing = ParseDiag::Active();
+        if (object.contains("alpn")) {
+            alpn = JsonStringList(object["alpn"], "tlsSettings.alpn");
+            // Xray's StringList also takes one comma-separated string.
+            if (importing) alpn = SplitAndTrim(alpn.join(','), ",", false);
+        }
+        if (object.contains("fingerprint")) {
+            const auto value = object["fingerprint"].toString();
+            fingerprint = importing ? xrayStreamKnownFingerprint(value, false, "tlsSettings.fingerprint") : value;
+        }
+        if (object.contains("cipherSuites")) cipherSuites = object["cipherSuites"].toString();
         if (object.contains("echConfigList")) echConfigList = object["echConfigList"].toString();
+        if (object.contains("useSystemCA")) useSystemCA = object["useSystemCA"].toBool();
         return true;
     }
 
@@ -281,9 +1315,16 @@ namespace Configs {
             serverName = QString::fromStdString(object.server);
         }
         for (const auto& s : object.alpn) {
-            alpn.append(QString::fromStdString(s));
+            if (const auto protocol = QString::fromStdString(s).trimmed(); !protocol.isEmpty()) alpn.append(protocol);
         }
-        if (!object.client_fingerprint.empty()) fingerprint = QString::fromStdString(object.client_fingerprint);
+        // mihomo's fingerprint is the certificate pin in hex, which Validate checks as for pcs; client-fingerprint is the uTLS hello.
+        if (!object.fingerprint.empty()) pinnedPeerCertSha256 = QString::fromStdString(object.fingerprint).trimmed();
+        // Xray's "unsafe" is Go's own TLS, which mihomo's "none" asks for; an empty fingerprint would mean Chrome.
+        if (IsClashNoFingerprint(object.client_fingerprint)) {
+            fingerprint = tlsUnsafeFingerprint;
+        } else if (!object.client_fingerprint.empty()) {
+            fingerprint = xrayStreamKnownFingerprint(QString::fromStdString(object.client_fingerprint), false, "client-fingerprint");
+        }
         return true;
     }
 
@@ -294,6 +1335,7 @@ namespace Configs {
         if (!verifyPeerCertByName.isEmpty()) query.addQueryItem("vcn", verifyPeerCertByName);
         if (!alpn.isEmpty()) query.addQueryItem("alpn", alpn.join(","));
         if (!fingerprint.isEmpty()) query.addQueryItem("fp", fingerprint);
+        if (!cipherSuites.isEmpty()) query.addQueryItem("cs", cipherSuites);
         if (!echConfigList.isEmpty()) query.addQueryItem("ech", echConfigList);
         return query.toString(QUrl::FullyEncoded);
     }
@@ -307,7 +1349,9 @@ namespace Configs {
             object["alpn"] = QListStr2QJsonArray(alpn);
         }
         if (!fingerprint.isEmpty()) object["fingerprint"] = fingerprint;
+        if (!cipherSuites.isEmpty()) object["cipherSuites"] = cipherSuites;
         if (!echConfigList.isEmpty()) object["echConfigList"] = echConfigList;
+        if (useSystemCA) object["useSystemCA"] = true;
         return object;
     }
 
@@ -324,10 +1368,14 @@ namespace Configs {
 
         if (query.hasQueryItem("sni")) serverName = query.queryItemValue("sni");
         if (query.hasQueryItem("peer")) serverName = query.queryItemValue("peer");
-        if (query.hasQueryItem("pbk")) password = query.queryItemValue("pbk");
-        if (query.hasQueryItem("fp")) fingerprint = query.queryItemValue("fp");
-        if (query.hasQueryItem("sid")) shortId = query.queryItemValue("sid");
-        if (query.hasQueryItem("spx")) spiderX = query.queryItemValue("spx", QUrl::FullyDecoded);
+        if (query.hasQueryItem("pbk")) password = ImportRealityPublicKey(query.queryItemValue("pbk"), "pbk");
+        if (query.hasQueryItem("fp")) fingerprint = xrayStreamKnownFingerprint(query.queryItemValue("fp"), true, "fp");
+        if (query.hasQueryItem("sid")) shortId = query.queryItemValue("sid").trimmed();
+        if (query.hasQueryItem("spx")) {
+            const auto value = query.queryItemValue("spx", QUrl::FullyDecoded);
+            if (AcceptOptional("spx", Checks::XraySpiderX(value), value)) spiderX = value;
+        }
+        if (query.hasQueryItem("pqv")) mldsa65Verify = query.queryItemValue("pqv", QUrl::FullyDecoded).trimmed();
         return true;
 
     }
@@ -335,10 +1383,22 @@ namespace Configs {
     bool xrayReality::ParseFromJson(const QJsonObject &object) {
         if (object.isEmpty()) return false;
         if (object.contains("serverName")) serverName = object["serverName"].toString();
-        if (object.contains("fingerprint")) fingerprint = object["fingerprint"].toString();
-        if (object.contains("password")) password = object["password"].toString();
-        if (object.contains("shortId")) shortId = object["shortId"].toString();
-        if (object.contains("spiderX")) spiderX = object["spiderX"].toString();
+        if (object.contains("fingerprint")) {
+            const auto value = object["fingerprint"].toString();
+            fingerprint = ParseDiag::Active() ? xrayStreamKnownFingerprint(value, true, "realitySettings.fingerprint") : value;
+        }
+        // Xray reads publicKey, the older name, when password is empty.
+        if (object.contains("password") || object.contains("publicKey")) {
+            const auto field = object["password"].toString().trimmed().isEmpty() ? QStringLiteral("publicKey") : QStringLiteral("password");
+            const auto key = object[field].toString();
+            password = ParseDiag::Active() ? ImportRealityPublicKey(key, "realitySettings." + field) : key.trimmed();
+        }
+        if (object.contains("shortId")) shortId = object["shortId"].toString().trimmed();
+        if (object.contains("spiderX")) {
+            const auto value = object["spiderX"].toString();
+            if (!ParseDiag::Active() || AcceptOptional("realitySettings.spiderX", Checks::XraySpiderX(value), value)) spiderX = value;
+        }
+        if (object.contains("mldsa65Verify")) mldsa65Verify = object["mldsa65Verify"].toString().trimmed();
         return true;
     }
 
@@ -350,9 +1410,14 @@ namespace Configs {
         } else {
             serverName = QString::fromStdString(object.server);
         }
-        if (!object.client_fingerprint.empty()) fingerprint = QString::fromStdString(object.client_fingerprint);
-        if (!object.reality_opts.public_key.empty()) password = QString::fromStdString(object.reality_opts.public_key);
-        if (!object.reality_opts.short_id.empty()) shortId = QString::fromStdString(object.reality_opts.short_id);
+        // REALITY needs uTLS, so mihomo's "none" leaves Xray's default.
+        if (!object.client_fingerprint.empty() && !IsClashNoFingerprint(object.client_fingerprint)) {
+            fingerprint = xrayStreamKnownFingerprint(QString::fromStdString(object.client_fingerprint), true, "client-fingerprint");
+        }
+        if (!object.reality_opts.public_key.empty()) {
+            password = ImportRealityPublicKey(QString::fromStdString(object.reality_opts.public_key), "reality-opts.public-key");
+        }
+        if (!object.reality_opts.short_id.empty()) shortId = QString::fromStdString(object.reality_opts.short_id).trimmed();
         return true;
     }
 
@@ -363,6 +1428,7 @@ namespace Configs {
         if (!password.isEmpty()) query.addQueryItem("pbk", password);
         if (!shortId.isEmpty()) query.addQueryItem("sid", shortId);
         if (!spiderX.isEmpty()) query.addQueryItem("spx", spiderX);
+        if (!mldsa65Verify.isEmpty()) query.addQueryItem("pqv", mldsa65Verify);
         return query.toString(QUrl::FullyEncoded);
     }
 
@@ -373,19 +1439,21 @@ namespace Configs {
         if (!password.isEmpty()) object["password"] = password;
         if (!shortId.isEmpty()) object["shortId"] = shortId;
         if (!spiderX.isEmpty()) object["spiderX"] = spiderX;
+        if (!mldsa65Verify.isEmpty()) object["mldsa65Verify"] = mldsa65Verify;
         return object;
     }
 
     BuildResult xrayReality::Build() {
         auto obj = ExportToJson();
         if (fingerprint.isEmpty() && !Configs::dataManager->settingsRepo->utlsFingerprint.isEmpty()) obj["fingerprint"] = Configs::dataManager->settingsRepo->utlsFingerprint;
+        // REALITY needs a uTLS hello and fails on "unsafe"; Xray's own default (chrome) takes over.
+        if (obj.value("fingerprint").toString().toLower() == tlsUnsafeFingerprint) obj.remove("fingerprint");
         return {obj, ""};
     }
 
     bool xrayXHTTP::ParseExtraJson(const QString &str) {
         auto obj = QString2QJsonObject(str);
-        // Python dict repr ('key': True), rewritten only when strict JSON fails so valid values stay intact.
-        if (obj.isEmpty()) obj = QString2QJsonObject(QString(str).replace('\'', '"').replace("True", "true").replace("False", "false"));
+        if (obj.isEmpty()) obj = QString2QJsonObject(pythonReprToJson(str));
         if (obj.isEmpty()) return false;
         parseXHTTPExtraObject(this, obj);
         return true;
@@ -400,17 +1468,12 @@ namespace Configs {
         if (query.hasQueryItem("host")) host = query.queryItemValue("host");
         if (query.hasQueryItem("path")) path = query.queryItemValue("path", QUrl::FullyDecoded);
         if (query.hasQueryItem("mode")) mode = query.queryItemValue("mode");
-        if (query.hasQueryItem("extra") && !ParseExtraJson(query.queryItemValue("extra", QUrl::FullyDecoded))) {
-            ParseExtraJson(formDecodedQueryValue(query, "extra"));
+        if (query.hasQueryItem("extra")) {
+            // Header values such as a User-Agent make a space likelier than a literal '+'.
+            const auto readings = queryValueDecodings(query, "extra", true);
+            if (std::none_of(readings.cbegin(), readings.cend(), [this](const QString& text) { return ParseExtraJson(text); })) warnUnparsableExtra(readings.first());
         }
-        if (query.hasQueryItem("headers")) {
-            auto raw = query.queryItemValue("headers", QUrl::FullyDecoded);
-            headers = raw.split("|");
-            if (headers.length()%2 != 0) {
-                MW_show_log("Failed to import invalid headers: " + raw);
-                headers.clear();
-            }
-        }
+        if (query.hasQueryItem("headers")) headers = linkHeaders(query);
         if (query.hasQueryItem("x_padding_bytes")) xPaddingBytes = query.queryItemValue("x_padding_bytes");
         if (query.hasQueryItem("no_grpc_header")) noGRPCHeader = query.queryItemValue("no_grpc_header").replace("1", "true") == "true";
 
@@ -424,7 +1487,11 @@ namespace Configs {
 
         if (query.hasQueryItem("max_request_times")) hMaxRequestTimes = query.queryItemValue("max_request_times");
         if (query.hasQueryItem("max_reusable_secs")) hMaxReusableSecs = query.queryItemValue("max_reusable_secs");
-        if (query.hasQueryItem("keep_alive_period")) hKeepAlivePeriod = query.queryItemValue("keep_alive_period").toLongLong();
+        if (query.hasQueryItem("keep_alive_period")) {
+            const auto value = query.queryItemValue("keep_alive_period").trimmed();
+            if (AcceptOptional("keep_alive_period", Validation::Int(value, LLONG_MIN, LLONG_MAX), value)) hKeepAlivePeriod = value.toLongLong();
+        }
+        dropUnusableXHTTPValues(*this);
         return true;
     }
 
@@ -443,9 +1510,10 @@ namespace Configs {
         }
         if (auto exObj = object["extra"].toObject(); !exObj.isEmpty()) {
             parseXHTTPExtraObject(this, exObj);
-        } else if (object["extra"].isString()) {
-            ParseExtraJson(object["extra"].toString());
+        } else if (object["extra"].isString() && !ParseExtraJson(object["extra"].toString())) {
+            warnUnparsableExtra(object["extra"].toString());
         }
+        if (ParseDiag::Active()) dropUnusableXHTTPValues(*this);
         return true;
     }
 
@@ -455,11 +1523,26 @@ namespace Configs {
         path = qs(opts.path);
         mode = hasText(opts.mode) ? qs(opts.mode) : "auto";
 
+        headers.clear();
+        for (const auto& [key, value] : opts.headers) headers << qs(key) << qs(value);
+        noGRPCHeader = opts.no_grpc_header;
+        xPaddingBytes = qs(opts.x_padding_bytes);
         xPaddingObfsMode = opts.x_padding_obfs_mode;
         xPaddingKey = qs(opts.x_padding_key);
         xPaddingHeader = qs(opts.x_padding_header);
         xPaddingPlacement = qs(opts.x_padding_placement);
         xPaddingMethod = qs(opts.x_padding_method);
+        uplinkHTTPMethod = qs(opts.uplink_http_method);
+        sessionIDPlacement = qs(opts.session_placement);
+        sessionIDKey = qs(opts.session_key);
+        sessionIDTable = qs(opts.session_table);
+        sessionIDLength = qs(opts.session_length);
+        seqPlacement = qs(opts.seq_placement);
+        seqKey = qs(opts.seq_key);
+        uplinkDataPlacement = qs(opts.uplink_data_placement);
+        uplinkDataKey = qs(opts.uplink_data_key);
+        uplinkChunkSize = qs(opts.uplink_chunk_size);
+        scMaxEachPostBytes = qs(opts.sc_max_each_post_bytes);
         scMinPostsIntervalMs = qs(opts.sc_min_posts_interval_ms);
 
         maxConcurrency = qs(opts.reuse_settings.max_concurrency);
@@ -471,8 +1554,10 @@ namespace Configs {
             hKeepAlivePeriod = qs(opts.reuse_settings.h_keep_alive_period).toLongLong();
         }
 
+        // Dropped first, so the download leg inherits only usable values.
+        dropUnusableXHTTPValues(*this);
         if (opts.has_download_settings) {
-            downloadSettings = QJsonObject2QString(buildDownloadSettingsObject(opts.download_settings), true);
+            downloadSettings = QJsonObject2QString(buildDownloadSettingsObject(object, ExportToJson().value("extra").toObject()), true);
         }
 
         return true;
@@ -487,10 +1572,10 @@ namespace Configs {
         if (jsonExport.contains("extra") && jsonExport["extra"].isObject()) {
             auto exObj = jsonExport["extra"].toObject();
             if (!exObj.isEmpty()) {
-                query.addQueryItem("extra", QJsonObject2QString(exObj, true));
+                query.addQueryItem("extra", queryLiteral(QJsonObject2QString(exObj, true)));
             }
         }
-        if (!headers.isEmpty()) query.addQueryItem("headers", headers.join("|"));
+        if (!headers.isEmpty()) query.addQueryItem("headers", queryLiteral(headers.join("|")));
         return query.toString(QUrl::FullyEncoded);
     }
 
@@ -527,7 +1612,8 @@ namespace Configs {
         exportString(extraObj, "scStreamUpServerSecs", scStreamUpServerSecs);
         exportInt(extraObj, "serverMaxHeaderBytes", serverMaxHeaderBytes);
         if (mode == "stream-one") {
-            extraObj.remove("downloadSettings");
+            // Xray refuses downloadSettings in stream-one mode under any spelling.
+            xrayStreamRemoveNamed(extraObj, QStringLiteral("downloadSettings"));
         } else if (!downloadSettings.isEmpty()) {
             if (auto dsObj = QString2QJsonObject(downloadSettings); !dsObj.isEmpty()) {
                 extraObj["downloadSettings"] = dsObj;
@@ -558,16 +1644,9 @@ namespace Configs {
         auto query = QUrlQuery(url.query());
         if (query.hasQueryItem("host")) host = query.queryItemValue("host");
         if (query.hasQueryItem("path")) path = query.queryItemValue("path", QUrl::FullyDecoded);
-        if (query.hasQueryItem("ed")) ed = query.queryItemValue("ed").toInt();
-        if (query.hasQueryItem("headers")) {
-            auto raw = query.queryItemValue("headers", QUrl::FullyDecoded);
-            headers = raw.split("|");
-            if (headers.length()%2 != 0) {
-                MW_show_log("Failed to import invalid headers: " + raw);
-                headers.clear();
-            }
-        }
-        if (query.hasQueryItem("heartbeat_period")) heartbeatPeriod = query.queryItemValue("heartbeat_period").toInt();
+        ReadQueryInt(query, "ed", ed);
+        if (query.hasQueryItem("headers")) headers = linkHeaders(query);
+        ReadQueryInt(query, "heartbeat_period", heartbeatPeriod);
         return true;
     }
 
@@ -597,15 +1676,11 @@ namespace Configs {
                 ed = spl[1].toInt();
             }
         }
-        if (!object.servername.empty()) {
+        // mihomo sends the ws-opts Host header as the HTTP Host and uses servername only for the SNI.
+        if (const auto headerHost = clashWsHeaders(object.ws_opts.headers, headers); !headerHost.isEmpty()) {
+            host = headerHost;
+        } else if (!object.servername.empty()) {
             host = QString::fromStdString(object.servername);
-        } else if (object.ws_opts.headers.contains("Host")) {
-            host = QString::fromStdString(object.ws_opts.headers.at("Host"));
-        }
-        if (!object.ws_opts.headers.empty()) {
-            for (const auto& [key, value] : object.ws_opts.headers) {
-                headers.append(QString::fromStdString(key) + "=" + QString::fromStdString(value));
-            }
         }
         return true;
     }
@@ -643,12 +1718,8 @@ namespace Configs {
         auto query = QUrlQuery(url.query());
         if (query.hasQueryItem("host")) host = query.queryItemValue("host");
         if (query.hasQueryItem("path")) path = query.queryItemValue("path", QUrl::FullyDecoded);
-        if (query.hasQueryItem("ed")) ed = query.queryItemValue("ed").toInt();
-        if (query.hasQueryItem("headers")) {
-            auto raw = query.queryItemValue("headers", QUrl::FullyDecoded);
-            headers = raw.split("|");
-            if (headers.size() % 2 != 0) headers.clear();
-        }
+        ReadQueryInt(query, "ed", ed);
+        if (query.hasQueryItem("headers")) headers = linkHeaders(query);
         return true;
     }
 
@@ -677,15 +1748,11 @@ namespace Configs {
                 ed = spl[1].toInt();
             }
         }
-        if (!object.servername.empty()) {
+        // mihomo sends the ws-opts Host header as the HTTP Host and uses servername only for the SNI.
+        if (const auto headerHost = clashWsHeaders(object.ws_opts.headers, headers); !headerHost.isEmpty()) {
+            host = headerHost;
+        } else if (!object.servername.empty()) {
             host = QString::fromStdString(object.servername);
-        } else if (object.ws_opts.headers.contains("Host")) {
-            host = QString::fromStdString(object.ws_opts.headers.at("Host"));
-        }
-        if (!object.ws_opts.headers.empty()) {
-            for (const auto& [key, value] : object.ws_opts.headers) {
-                headers.append(QString::fromStdString(key) + "=" + QString::fromStdString(value));
-            }
         }
         return true;
     }
@@ -758,6 +1825,107 @@ namespace Configs {
         return {ExportToJson(), ""};
     }
 
+    bool xrayXDrive::ParseFromLink(const QString &) {
+        return false;
+    }
+
+    bool xrayXDrive::ParseFromJson(const QJsonObject &object) {
+        if (object.isEmpty()) return false;
+        if (object.contains("service")) {
+            service = object["service"].toString();
+            if (service == QLatin1String("Google Drive")) service = QStringLiteral("google-drive");
+        }
+        if (object.contains("remoteFolder")) remoteFolder = object["remoteFolder"].toString();
+        if (object.contains("secrets")) secrets = JsonStringList(object["secrets"], "xdriveSettings.secrets");
+        if (object["template"].isObject()) templateSpec = object["template"].toObject();
+        if (object["s3"].isObject()) {
+            const auto s3 = object["s3"].toObject();
+            s3Endpoint = s3["endpoint"].toString();
+            s3Region = s3["region"].toString();
+            s3Bucket = s3["bucket"].toString();
+            s3PathStyle = s3["pathStyle"].toBool(true);
+        }
+        for (const auto& [key, field] : xdriveTuning()) {
+            if (object.contains(key)) this->*field = object[key].toInteger();
+        }
+        if (object["xmux"].isObject()) xmux = object["xmux"].toObject();
+        return true;
+    }
+
+    bool xrayXDrive::ParseFromClash(const clash::Proxies&) {
+        return false;
+    }
+
+    QString xrayXDrive::ExportToLink() {
+        return {};
+    }
+
+    QJsonObject xrayXDrive::ExportToJson() {
+        QJsonObject obj;
+        obj["service"] = service;
+        if (!remoteFolder.isEmpty()) obj["remoteFolder"] = remoteFolder;
+        if (!secrets.isEmpty()) obj["secrets"] = QListStr2QJsonArray(secrets);
+        if (!templateSpec.isEmpty()) obj["template"] = templateSpec;
+        // Xray reads the s3 object only for the s3 service, so another service drops it.
+        if (service == "s3") {
+            QJsonObject s3;
+            s3["endpoint"] = s3Endpoint;
+            if (!s3Region.isEmpty()) s3["region"] = s3Region;
+            s3["bucket"] = s3Bucket;
+            if (!s3PathStyle) s3["pathStyle"] = false;
+            obj["s3"] = s3;
+        }
+        for (const auto& [key, field] : xdriveTuning()) {
+            if (this->*field != 0) obj[key] = this->*field;
+        }
+        if (!xmux.isEmpty()) obj["xmux"] = xmux;
+        return obj;
+    }
+
+    BuildResult xrayXDrive::Build() {
+        return {ExportToJson(), ""};
+    }
+
+    bool xrayKCP::ParseFromLink(const QString &link) {
+        const QUrlQuery query(QUrl(link).query());
+        for (const auto& [key, field] : {std::pair{QStringLiteral("mtu"), &xrayKCP::mtu}, std::pair{QStringLiteral("tti"), &xrayKCP::tti}}) {
+            if (!query.hasQueryItem(key)) continue;
+            const auto text = query.queryItemValue(key).trimmed();
+            if (!AcceptOptional(key, xrayKCPCheck(key, text, mtu), text)) continue;
+            if (const auto value = Validation::ToInt(text)) this->*field = *value;
+        }
+        return true;
+    }
+
+    bool xrayKCP::ParseFromJson(const QJsonObject &object) {
+        const bool importing = ParseDiag::Active();
+        for (const auto& value : kXrayKCPValues) {
+            const QString key = QLatin1String(value.key);
+            if (!object.contains(key)) continue;
+            const auto text = xrayKCPJsonText(object.value(key));
+            if (importing && !AcceptOptional("kcpSettings." + key, xrayKCPCheck(key, text, mtu), text)) continue;
+            if (const auto number = Validation::ToInt(text)) this->*value.field = *number;
+        }
+        return true;
+    }
+
+    QString xrayKCP::ExportToLink() {
+        QUrlQuery query;
+        query.addQueryItem("mtu", QString::number(mtu));
+        query.addQueryItem("tti", QString::number(tti));
+        return query.toString(QUrl::FullyEncoded);
+    }
+
+    QJsonObject xrayKCP::ExportToJson() {
+        QJsonObject object;
+        for (const auto& value : kXrayKCPValues) object.insert(QLatin1String(value.key), this->*value.field);
+        return object;
+    }
+
+    BuildResult xrayKCP::Build() {
+        return {ExportToJson(), ""};
+    }
+
     bool xrayStreamSetting::ParseFromLink(const QString &link) {
         auto url = QUrl(link);
         if (!url.isValid()) return false;
@@ -765,19 +1933,33 @@ namespace Configs {
 
         if (query.hasQueryItem("fm") || query.hasQueryItem("finalmask")) {
             auto key = query.hasQueryItem("fm") ? "fm" : "finalmask";
-            auto fmRaw = query.queryItemValue(key, QUrl::FullyDecoded);
+            // Mask values are mostly base64 and hex, where a bare '+' is more likely literal than a space.
             QJsonParseError err;
-            auto doc = QJsonDocument::fromJson(fmRaw.toUtf8(), &err);
-            if (err.error != QJsonParseError::NoError) doc = QJsonDocument::fromJson(formDecodedQueryValue(query, key).toUtf8(), &err);
+            QJsonDocument doc;
+            for (const auto& text : queryValueDecodings(query, key, false)) {
+                doc = QJsonDocument::fromJson(text.toUtf8(), &err);
+                if (err.error == QJsonParseError::NoError) break;
+            }
             if (err.error == QJsonParseError::NoError && doc.isObject()) {
                 finalmask = doc.object();
             } else if (err.error != QJsonParseError::NoError) {
-                MW_show_log("Failed to parse FinalMask JSON: " + err.errorString());
+                ParseDiag::Warn(key, QCoreApplication::translate("Validation", "The finalmask value is not valid JSON (%1), so it was ignored.").arg(err.errorString()));
+            } else {
+                ParseDiag::Warn(key, QCoreApplication::translate("Validation", "The finalmask value must be a JSON object, so it was ignored."));
             }
         }
+        UpgradeXrayFinalmask(finalmask);
 
-        if (query.hasQueryItem("type")) network = query.queryItemValue("type").replace("tcp", "raw");
-        if (!Configs::XrayNetworks.contains(network)) return false;
+        if (const auto type = query.queryItemValue("type"); !type.isEmpty()) network = NormalizeXrayNetwork(type);
+        if (!Configs::XrayNetworks.contains(network)) {
+            // A share link has no lossless fallback, unlike an Xray JSON outbound, which is then kept verbatim.
+            ParseDiag::Error("type", Checks::XrayNetwork(network), network);
+            return false;
+        }
+        if (network == "xdrive") {
+            ParseDiag::Error("type", QCoreApplication::translate("Validation", "XDRIVE has no share-link format. Import the server's JSON configuration instead."), network);
+            return false;
+        }
         if (network == "raw" && query.queryItemValue("headerType") == "http") {
             QJsonObject request;
             if (const auto paths = splitList(query.queryItemValue("path", QUrl::FullyDecoded)); !paths.isEmpty()) {
@@ -791,13 +1973,19 @@ namespace Configs {
             if (!request.isEmpty()) header["request"] = request;
             rawSettings = QJsonObject{{"header", header}};
         }
-        if (query.hasQueryItem("security")) security = query.queryItemValue("security");
+        // Xray matches security case-insensitively.
+        if (query.hasQueryItem("security")) security = query.queryItemValue("security").trimmed().toLower();
         if (security == "tls") TLS->ParseFromLink(link);
         else if (security == "reality") reality->ParseFromLink(link);
         if (network == "xhttp") xhttp->ParseFromLink(link);
         else if (network == "ws") ws->ParseFromLink(link);
         else if (network == "httpupgrade") httpupgrade->ParseFromLink(link);
         else if (network == "grpc") grpc->ParseFromLink(link);
+        else if (network == "kcp") {
+            kcp->ParseFromLink(link);
+            xrayKCPImportLegacy(finalmask, "headerType", query.queryItemValue("headerType", QUrl::FullyDecoded), {},
+                                query.queryItemValue("seed", QUrl::FullyDecoded));
+        }
 
         return true;
     }
@@ -806,33 +1994,67 @@ namespace Configs {
         if (object.isEmpty()) return false;
 
         if (object.contains("finalmask") && object["finalmask"].isObject()) finalmask = object["finalmask"].toObject();
+        if (ParseDiag::Active()) UpgradeXrayFinalmask(finalmask);
         if (object["sockopt"].isObject()) {
             sockopt = object["sockopt"].toObject();
-            // dialerProxy names an outbound of the source config, and domainStrategy would outrank ThroneWiring's resolver.
-            sockopt.remove("dialerProxy");
-            sockopt.remove("domainStrategy");
+            xrayStreamStripDialerKeys(sockopt);
         }
 
         if (object.contains("method")) network = object.value("method").toString();
         else if (object.contains("network")) network = object.value("network").toString();
-        if (network == "tcp") network = "raw";
+        network = NormalizeXrayNetwork(network);
         if (!Configs::XrayNetworks.contains(network)) return false;
         if (network == "raw") {
             if (object["rawSettings"].isObject()) rawSettings = object["rawSettings"].toObject();
             else if (object["tcpSettings"].isObject()) rawSettings = object["tcpSettings"].toObject();
         }
-        if (object.contains("security")) security = object.value("security").toString();
+        if (object.contains("security")) security = object.value("security").toString().trimmed().toLower();
         if (security == "tls" && object["tlsSettings"].isObject()) TLS->ParseFromJson(object["tlsSettings"].toObject());
         else if (security == "reality" && object["realitySettings"].isObject()) reality->ParseFromJson(object["realitySettings"].toObject());
-        if (network == "xhttp" && object["xhttpSettings"].isObject()) xhttp->ParseFromJson(object["xhttpSettings"].toObject());
+        if (network == "xhttp") {
+            // splithttpSettings is Xray's older key; xhttpSettings wins when both are set.
+            const auto xhttpSettings = object["xhttpSettings"].isObject() ? object["xhttpSettings"] : object["splithttpSettings"];
+            if (xhttpSettings.isObject()) xhttp->ParseFromJson(xhttpSettings.toObject());
+        }
         if (network == "ws" && object["wsSettings"].isObject()) ws->ParseFromJson(object["wsSettings"].toObject());
         if (network == "httpupgrade" && object["httpupgradeSettings"].isObject()) httpupgrade->ParseFromJson(object["httpupgradeSettings"].toObject());
         if (network == "grpc" && object["grpcSettings"].isObject()) grpc->ParseFromJson(object["grpcSettings"].toObject());
+        if (network == "kcp") {
+            const auto settings = object["kcpSettings"].toObject();
+            kcp->ParseFromJson(settings);
+            if (ParseDiag::Active()) {
+                const auto header = settings.value("header").toObject();
+                xrayKCPImportLegacy(finalmask, "kcpSettings.header.type", header.value("type").toString(), header.value("domain").toString(),
+                                    settings.value("seed").toString());
+            }
+        }
+        if (network == "xdrive") {
+            if (object["xdriveSettings"].isObject()) xdrive->ParseFromJson(object["xdriveSettings"].toObject());
+            if (object.contains("address")) xdrive->frontAddress = object["address"].toString();
+            if (object.contains("port")) xdrive->frontPort = object["port"].toInt();
+        }
+        if (object.contains("xdnsResolvers")) {
+            const auto value = object["xdnsResolvers"];
+            QStringList lines;
+            for (const auto& item : value.isArray() ? value.toArray() : QJsonArray{value}) {
+                if (item.isString()) lines << item.toString();
+                else if (!item.isNull()) ParseDiag::Warn("xdnsResolvers", QCoreApplication::translate("Validation", "List items that are not text were ignored."));
+            }
+            xdnsResolvers.lines = ImportResolverLines(lines, ResolverFlavor::Xdns, "xdnsResolvers");
+        }
+        if (object.contains("xdnsResolverList")) {
+            if (ParseDiag::Active()) {
+                ParseDiag::Warn("xdnsResolverList", QCoreApplication::translate("Validation", "The resolver IP list belongs to another installation, so it was not imported."));
+            } else {
+                xdnsResolvers.ipListId = object["xdnsResolverList"].toInt(-1);
+            }
+        }
         return true;
     }
 
     bool xrayStreamSetting::ParseFromClash(const clash::Proxies& object) {
         if (!object.network.empty()) network = QString::fromStdString(object.network);
+        if (network == "tcp") network = "raw";
         if (network != "raw" && network != "ws" && network != "grpc" && network != "xhttp") return false;
         if (object.tls) {
             if (object.reality_opts.public_key.empty()) {
@@ -859,7 +2081,7 @@ namespace Configs {
     QString xrayStreamSetting::ExportToLink() {
         QUrlQuery query;
         if (!network.isEmpty()) query.addQueryItem("type", network == "raw" ? "tcp" : network);
-        if (!finalmask.isEmpty()) query.addQueryItem("fm", QJsonObject2QString(finalmask, true));
+        if (const auto shared = xrayShareFinalmask(finalmask); !shared.isEmpty()) query.addQueryItem("fm", queryLiteral(QJsonObject2QString(shared, true)));
         // value(), never operator[]: the mutable operator[] inserts a null entry for a missing key.
         if (const auto header = rawSettings.value("header").toObject();
             network == "raw" && header.value("type").toString() == "http") {
@@ -879,6 +2101,7 @@ namespace Configs {
         if (network == "ws") mergeUrlQuery(query, ws->ExportToLink());
         if (network == "httpupgrade") mergeUrlQuery(query, httpupgrade->ExportToLink());
         if (network == "grpc") mergeUrlQuery(query, grpc->ExportToLink());
+        if (network == "kcp") mergeUrlQuery(query, kcp->ExportToLink());
         return query.toString(QUrl::FullyEncoded);
     }
 
@@ -895,6 +2118,16 @@ namespace Configs {
         if (network == "ws") object["wsSettings"] = ws->ExportToJson();
         if (network == "httpupgrade") object["httpupgradeSettings"] = httpupgrade->ExportToJson();
         if (network == "grpc") object["grpcSettings"] = grpc->ExportToJson();
+        if (network == "kcp") object["kcpSettings"] = kcp->ExportToJson();
+        if (network == "xdrive") {
+            object["xdriveSettings"] = xdrive->ExportToJson();
+            if (!xdrive->frontAddress.isEmpty()) object["address"] = toAceHost(xdrive->frontAddress);
+            if (xdrive->frontPort > 0) object["port"] = xdrive->frontPort;
+        }
+        if (IsXdns()) {
+            if (!xdnsResolvers.lines.isEmpty()) object["xdnsResolvers"] = QListStr2QJsonArray(xdnsResolvers.lines);
+            if (xdnsResolvers.ipListId >= 0) object["xdnsResolverList"] = xdnsResolvers.ipListId;
+        }
         return object;
     }
 
@@ -912,14 +2145,51 @@ namespace Configs {
             if (!TLS->echConfigList.isEmpty())
                 object["ech"] = TLS->echConfigList.contains("://") ? TLS->echConfigList : QStringLiteral("static");
         }
+        // The VLESS address is nominal on XDRIVE; the storage is what tells two profiles apart.
+        if (network == "xdrive") {
+            object["service"] = xdrive->service;
+            if (!xdrive->remoteFolder.isEmpty()) object["folder"] = xdrive->remoteFolder;
+            if (xdrive->service == "s3") {
+                object["endpoint"] = xdrive->s3Endpoint;
+                object["bucket"] = xdrive->s3Bucket;
+            }
+        }
+        // XDNS reaches the server through resolvers, so its tunnel domain tells two profiles apart.
+        if (IsXdns()) {
+            QStringList names;
+            for (const auto& mask : xrayStreamValue(finalmask, QStringLiteral("udp"), true).toArray()) {
+                if (xrayMaskType(mask) != "xdns") continue;
+                for (const auto& name : xrayXdnsNames(xrayStreamValue(mask.toObject(), QStringLiteral("settings"), true).toObject())) {
+                    names << XrayLower(name);
+                }
+            }
+            names.sort();
+            names.removeDuplicates();
+            object["xdns"] = QJsonArray::fromStringList(names);
+        }
         return object;
+    }
+
+    bool XrayFinalmaskHasXdns(const QJsonObject& finalmask)
+    {
+        for (const auto& mask : xrayStreamValue(finalmask, QStringLiteral("udp"), true).toArray()) {
+            if (xrayMaskType(mask) == "xdns") return true;
+        }
+        return false;
+    }
+
+    bool xrayStreamSetting::IsXdns() const
+    {
+        return NormalizeXrayNetwork(network) == "kcp" && XrayFinalmaskHasXdns(finalmask);
     }
 
 
     QString getDirectDomainStrategy() {
         const auto &settings = *Configs::dataManager->settingsRepo;
+        bool routeOwnsDns = false;
+        const auto dns = Configs::RouteDns::Current(&routeOwnsDns);
         // No DNS rule blanks AAAA for these lookups any more, so the switch caps the strategy instead.
-        if (settings.direct_dns_disable_ipv6 && !settings.use_dns_object) return "ipv4_only";
+        if (dns.direct_dns_disable_ipv6 && (routeOwnsDns || !settings.use_dns_object)) return "ipv4_only";
         return settings.default_domain_strategy;
     }
 
@@ -936,7 +2206,472 @@ namespace Configs {
     }
 
     BuildResult xrayStreamSetting::Build() {
+        return Build(QStringLiteral("XDNS"));
+    }
+
+    BuildResult xrayStreamSetting::Build(const QString& owner) {
         // Default-NIC binding and domain resolution are wired on at instance creation (ThroneWiring), not here.
-        return {ExportToJson(), ""};
+        auto object = ExportToJson();
+        object.remove(QStringLiteral("xdnsResolvers"));
+        object.remove(QStringLiteral("xdnsResolverList"));
+        if (IsXdns() && !xdnsResolvers.IsEmpty()) {
+            const auto built = BuildResolvers(xdnsResolvers, ResolverFlavor::Xdns, owner);
+            if (!built.error.isEmpty()) return {{}, built.error};
+            if (!built.resolvers.isEmpty()) {
+                auto mask = finalmask;
+                xrayXdnsReplaceResolvers(mask, built.resolvers);
+                object["finalmask"] = mask;
+            }
+        }
+        if (security == "tls") object["tlsSettings"] = TLS->Build().object;
+        else if (security == "reality") object["realitySettings"] = reality->Build().object;
+        return {object, ""};
+    }
+
+    namespace Checks {
+        QString XrayNetwork(const QString& network)
+        {
+            const auto t = network.trimmed();
+            if (t.isEmpty() || XrayNetworks.contains(NormalizeXrayNetwork(t))) return {};
+            return QCoreApplication::translate("Validation", "Throne does not support the Xray transport \"%1\". Use raw, xhttp, ws, httpupgrade, grpc, kcp or xdrive.").arg(t);
+        }
+
+        QString XraySecurity(const QString& security)
+        {
+            static const QStringList known = {"", "none", "tls", "reality"};
+            const auto t = security.trimmed();
+            if (known.contains(t.toLower())) return {};
+            return QCoreApplication::translate("Validation", "Xray does not support the security \"%1\". Use none, tls or reality.").arg(t);
+        }
+
+        QString XrayRealityNetwork(const QString& security, const QString& network)
+        {
+            const auto t = NormalizeXrayNetwork(network.trimmed());
+            if (security.trimmed().toLower() != "reality" || t.isEmpty() || t == "raw" || t == "xhttp" || t == "grpc") return {};
+            return QCoreApplication::translate("Validation", "REALITY works only with the raw, xhttp or grpc transport.");
+        }
+
+        QString XrayFingerprint(const QString& fingerprint, bool reality)
+        {
+            const auto t = fingerprint.trimmed().toLower();
+            if (t.isEmpty()) return {};
+            // xrayReality::Build drops "unsafe"; Xray refuses hellogolang for REALITY.
+            if (reality && t == "hellogolang") return QCoreApplication::translate("Validation", "REALITY cannot use the hellogolang fingerprint; choose another one.");
+            if (xrayStreamFingerprints().contains(t)) return {};
+            return QCoreApplication::translate("Validation", "Xray does not know the fingerprint \"%1\". Use chrome, firefox, safari, ios, android, edge, 360, qq, random, randomized or unsafe.").arg(fingerprint.trimmed());
+        }
+
+        QString XrayCipherSuites(const QString& text)
+        {
+            for (const auto& name : splitCipherSuites(text)) {
+                if (tlsSecureCipherSuites.contains(name) || tlsInsecureCipherSuites.contains(name)) continue;
+                return QCoreApplication::translate("Validation", "Xray ignores the unknown cipher suite \"%1\".").arg(name);
+            }
+            return {};
+        }
+
+        QString XrayCipherSuitesNeedUnsafe(const QString& cipherSuites, const QString& fingerprint)
+        {
+            if (splitCipherSuites(cipherSuites).isEmpty() || fingerprint.trimmed().toLower() == tlsUnsafeFingerprint) return {};
+            return QCoreApplication::translate("Validation", "Cipher suites only take effect with the unsafe fingerprint.");
+        }
+
+        QString XrayPinnedSha256(const QString& text)
+        {
+            return Validation::EachItem(text, Validation::Split::Comma, [](const QString& item) -> QString {
+                if (Validation::Hex(QString(item).remove(':'), 64, 64, true, Validation::Empty::Required).isEmpty()) return {};
+                return QCoreApplication::translate("Validation", "Must be a SHA-256 in hexadecimal (64 characters, colons allowed).");
+            });
+        }
+
+        QString XrayEchConfigList(const QString& text, const QString& serverName)
+        {
+            const auto t = text.trimmed();
+            if (t.isEmpty()) return {};
+            if (!t.contains(QLatin1String("://"))) {
+                if (Validation::Base64(t).isEmpty()) return {};
+                return QCoreApplication::translate("Validation", "Must be a base64 ECHConfigList, or domain+https://dns/dns-query to fetch it over DNS.");
+            }
+            // Xray transport/internet/tls/ech.go: "name+server", else the SNI when it is a domain.
+            QString name;
+            if (const auto plus = t.indexOf('+'); plus >= 0) {
+                name = t.left(plus).trimmed();
+            } else if (const auto sni = serverName.trimmed(); !sni.isEmpty() && !Validation::Ip(QString(sni).remove('[').remove(']')).isEmpty()) {
+                name = sni;
+            }
+            if (!name.isEmpty()) return {};
+            return QCoreApplication::translate("Validation", "Fetching ECH over DNS needs a domain SNI; otherwise write it as domain+https://dns/dns-query.");
+        }
+
+        QString XraySpiderX(const QString& spiderX)
+        {
+            const auto t = spiderX.trimmed();
+            if (t.isEmpty() || t.startsWith('/')) return {};
+            return QCoreApplication::translate("Validation", "Must start with /, for example /search?q=1.");
+        }
+
+        QString XrayMldsa65Verify(const QString& key)
+        {
+            // Xray infra/conf/transport_security.go: RawURLEncoding of a 1952-byte ML-DSA-65 public key.
+            return Validation::Base64Key(key, 1952, true, false, Validation::Empty::Allowed);
+        }
+
+        QString XrayHeadersHost(const QStringList& pairs)
+        {
+            for (qsizetype i = 0; i < pairs.size(); i += 2) {
+                if (pairs[i].trimmed().compare(QLatin1String("host"), Qt::CaseInsensitive) == 0) {
+                    return QCoreApplication::translate("Validation", "Remove the Host header and put the host in the Host field instead.");
+                }
+            }
+            return {};
+        }
+
+        QString XrayInt32Range(const QString& text)
+        {
+            return Validation::IntOrRange(text, INT_MIN, INT_MAX, Validation::Empty::Allowed, true);
+        }
+
+        QString XrayXPaddingBytes(const QString& text)
+        {
+            qint64 from = 0, to = 0;
+            if (!xrayStreamRange(text, from, to)) return XrayInt32Range(text);
+            if ((from == 0 && to == 0) || (from > 0 && to > 0)) return {};
+            return QCoreApplication::translate("Validation", "Both bounds must be greater than 0, for example 100-1000.");
+        }
+
+        QString XrayXHTTPMode(const QString& mode)
+        {
+            return Validation::OneOf(mode, QStringList{""} + XrayXHTTPModes);
+        }
+
+        QString XrayPaddingMethod(const QString& method)
+        {
+            return Validation::OneOf(method, {"", "repeat-x", "tokenish"});
+        }
+
+        QString XrayPaddingPlacement(const QString& placement)
+        {
+            return Validation::OneOf(placement, {"", "queryInHeader", "cookie", "header", "query"});
+        }
+
+        QString XrayMetaPlacement(const QString& placement)
+        {
+            return Validation::OneOf(placement, XrayXHTTPMetaPlacements);
+        }
+
+        QString XrayUplinkDataPlacement(const QString& placement, const QString& mode)
+        {
+            if (auto message = Validation::OneOf(placement, XrayXHTTPUplinkDataPlacements); !message.isEmpty()) return message;
+            const auto t = placement.trimmed();
+            // Literally packet-up: Xray checks before it resolves auto.
+            if ((t == "cookie" || t == "header") && mode.trimmed() != "packet-up") {
+                return QCoreApplication::translate("Validation", "Cookie and header placement need the packet-up mode.");
+            }
+            return {};
+        }
+
+        QString XrayUplinkMethod(const QString& method, const QString& mode)
+        {
+            if (method.trimmed().toUpper() != "GET" || mode.trimmed() == "packet-up") return {};
+            return QCoreApplication::translate("Validation", "GET uploads need the packet-up mode.");
+        }
+
+        QString XraySessionId(const QString& table, const QString& length)
+        {
+            static const QHash<QString, QString> predefined = {
+                {"ALPHABET", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+                {"Alphabet", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"},
+                {"BASE36", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+                {"Base62", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"},
+                {"HEX", "0123456789ABCDEF"},
+                {"alphabet", "abcdefghijklmnopqrstuvwxyz"},
+                {"base36", "0123456789abcdefghijklmnopqrstuvwxyz"},
+                {"hex", "0123456789abcdef"},
+                {"number", "0123456789"},
+            };
+            if (table.isEmpty()) return {};
+            const auto bytes = predefined.value(table, table).toUtf8();
+            qint64 from = 0, to = 0;
+            if (!xrayStreamRange(length, from, to)) return {};
+            if (from <= 0) return QCoreApplication::translate("Validation", "Set a session ID length that starts above 0, for example 8-16.");
+            // Xray roomSize: the sum of n^k over the length range must reach 2^31.
+            constexpr double kRoom = 2147483648.0;
+            double room = 0;
+            if (bytes.size() == 1) {
+                room = double(to - from + 1);
+            } else {
+                for (qint64 k = from; k <= to && room < kRoom; ++k) room += std::pow(double(bytes.size()), double(k));
+            }
+            if (room < kRoom) {
+                return QCoreApplication::translate("Validation", "The table and length allow too few session IDs; use a longer length (for example 8-16) or a larger table.");
+            }
+            if (std::any_of(bytes.cbegin(), bytes.cend(), [](char c) { return static_cast<unsigned char>(c) >= 0x80; })) {
+                return QCoreApplication::translate("Validation", "The table must contain only ASCII characters.");
+            }
+            return {};
+        }
+
+        QString XrayXmuxExclusive(const QString& maxConnections, const QString& maxConcurrency)
+        {
+            qint64 fromA = 0, toA = 0, fromB = 0, toB = 0;
+            if (!xrayStreamRange(maxConnections, fromA, toA) || !xrayStreamRange(maxConcurrency, fromB, toB)) return {};
+            if (toA <= 0 || toB <= 0) return {};
+            return QCoreApplication::translate("Validation", "Set either Max Connections or Max Concurrency, not both.");
+        }
+
+        void XrayXHTTPDownloadLeg(Validation::Issues& issues, const QString& at, const QJsonObject& outbound)
+        {
+            auto copy = outbound;
+            xrayStreamEditLive(xrayStreamRoot(copy, at), QStringLiteral("streamSettings"), false, [&](const QList<XrayStreamNode>& streams) {
+                if (!xrayStreamDialsXHTTP(streams)) return;
+                xrayStreamEditDownloadLeg(streams, [&](const QList<XrayStreamNode>& leg) { xrayStreamDownloadEndpoint(issues, leg); });
+            });
+        }
+
+        QString XrayXDriveService(const QString& service)
+        {
+            if (XrayXDriveServices.contains(service.trimmed())) return {};
+            return QCoreApplication::translate("Validation", "Must be google-drive, s3, template or local.");
+        }
+
+        QString XrayXDriveFolder(const QString& service, const QString& folder)
+        {
+            const auto s = service.trimmed();
+            if (s == "s3") {
+                auto prefix = folder.trimmed();
+                if (prefix.isEmpty()) return QCoreApplication::translate("Validation", "Enter the key prefix both ends share in the bucket.");
+                if (prefix.endsWith('/')) prefix.chop(1);
+                if (xdriveS3Name(prefix)) return {};
+                return QCoreApplication::translate("Validation", "The key prefix must be relative, without empty, \".\" or \"..\" parts, backslashes or control characters.");
+            }
+            if (!folder.trimmed().isEmpty() || (s != "google-drive" && s != "local")) return {};
+            if (s == "local") return QCoreApplication::translate("Validation", "Enter the directory both ends share.");
+            return QCoreApplication::translate("Validation", "Enter the ID of the Google Drive folder both ends share.");
+        }
+
+        QString XrayXDriveSecrets(const QString& service, const QStringList& secrets)
+        {
+            if (service.trimmed() == "s3") {
+                if (secrets.size() < 2 || secrets.size() > 3 || secrets[0].trimmed().isEmpty() || secrets[1].trimmed().isEmpty())
+                    return QCoreApplication::translate("Validation", "S3 needs the access key ID and the secret access key; the session token is optional.");
+                if (!std::all_of(secrets.cbegin(), secrets.cend(), xdriveHeaderValue))
+                    return QCoreApplication::translate("Validation", "The S3 keys cannot contain control characters.");
+                if (secrets[0].contains(QRegularExpression("[/ ,\\t]")))
+                    return QCoreApplication::translate("Validation", "The access key ID cannot contain spaces, commas or slashes.");
+                return {};
+            }
+            if (service.trimmed() != "google-drive") return {};
+            // Xray drive.go: exactly three, none empty.
+            if (secrets.size() == 3 && std::none_of(secrets.cbegin(), secrets.cend(), [](const QString& s) { return s.trimmed().isEmpty(); })) return {};
+            return QCoreApplication::translate("Validation", "Google Drive needs the client ID, client secret and refresh token.");
+        }
+
+        QString XrayXDriveTemplate(const QString& service, const QJsonObject& templateSpec)
+        {
+            if (service.trimmed() != "template" || !templateSpec.isEmpty()) return {};
+            return QCoreApplication::translate("Validation", "The template service needs a template describing the storage API.");
+        }
+
+        QString XrayXDriveS3Endpoint(const QString& service, const QString& endpoint)
+        {
+            if (service.trimmed() != "s3") return {};
+            const auto text = endpoint.trimmed();
+            if (text.isEmpty()) return QCoreApplication::translate("Validation", "Enter the S3 endpoint URL, such as https://s3.example.com.");
+            const QUrl url(text, QUrl::StrictMode);
+            const auto scheme = url.scheme().toLower();
+            if (url.isValid() && (scheme == "https" || scheme == "http") && !url.host().isEmpty() && url.userInfo().isEmpty()
+                && !url.hasQuery() && !url.hasFragment()) return {};
+            return QCoreApplication::translate("Validation", "The endpoint must be an http or https URL without credentials, query or fragment.");
+        }
+
+        QString XrayXDriveS3Region(const QString& service, const QString& region)
+        {
+            if (service.trimmed() != "s3") return {};
+            if (xdriveHeaderValue(region) && !region.contains(QRegularExpression("[/, \\t]"))) return {};
+            return QCoreApplication::translate("Validation", "The signing region cannot contain spaces, commas, slashes or control characters.");
+        }
+
+        QString XrayXDriveS3Bucket(const QString& service, const QString& bucket, const QString& endpoint, bool pathStyle)
+        {
+            if (service.trimmed() != "s3") return {};
+            if (bucket.isEmpty()) return QCoreApplication::translate("Validation", "Enter the bucket both ends share.");
+            if (bucket.contains('/') || !xdriveS3Name(bucket))
+                return QCoreApplication::translate("Validation", "The bucket name cannot be \".\" or \"..\", nor contain slashes, backslashes or control characters.");
+            if (pathStyle) return {};
+            static const QRegularExpression dnsName("^[a-z0-9.-]+$");
+            if (!dnsName.match(bucket).hasMatch() || bucket.contains("..") || bucket.startsWith('.') || bucket.endsWith('.'))
+                return QCoreApplication::translate("Validation", "Virtual-hosted addressing needs a DNS-compatible bucket name: lowercase letters, digits, dots and hyphens.");
+            if (Validation::Ip(QUrl(endpoint.trimmed()).host()).isEmpty())
+                return QCoreApplication::translate("Validation", "Virtual-hosted addressing needs a DNS endpoint, not an IP address. Turn on path-style addressing instead.");
+            return {};
+        }
+
+        QString XrayXDriveTuning(const QString& text)
+        {
+            return Validation::Int(text, 0, UINT32_MAX);
+        }
+
+        QString XrayXDriveFrontPort(const QString& port)
+        {
+            return Validation::Port(port, Validation::Empty::Allowed);
+        }
+
+        QString XrayXDriveFrontPortAlone(const QString& address, const QString& port)
+        {
+            if (!address.trimmed().isEmpty() || Validation::ToInt(port.trimmed()).value_or(0) == 0) return {};
+            return QCoreApplication::translate("Validation", "The front port is used only together with a front address.");
+        }
+
+        QString XrayKCPMtu(const QString& text)
+        {
+            // A full data segment is MTU bytes in one of Xray's 8192-byte buffers; beyond that the core panics.
+            return Validation::Int(text, 21, 8192);
+        }
+
+        QString XrayKCPTti(const QString& text)
+        {
+            return Validation::Int(text, 10, 1000);
+        }
+
+        QString XrayKCPCapacity(const QString& text)
+        {
+            return Validation::Int(text, 0, UINT32_MAX);
+        }
+
+        QString XrayKCPCwndMultiplier(const QString& text)
+        {
+            return Validation::Int(text, 1, UINT32_MAX);
+        }
+
+        QString XrayKCPMaxSendingWindow(const QString& text, const QString& mtu)
+        {
+            if (auto message = Validation::Int(text, 0, UINT32_MAX); !message.isEmpty()) return message;
+            const auto window = Validation::ToInt(text.trimmed());
+            const auto packet = Validation::ToInt(mtu.trimmed()).value_or(xrayKCP::DefaultMtu);
+            if (!window || packet <= 0 || *window >= packet) return {};
+            return QCoreApplication::translate("Validation", "Must be at least the MTU (%1).").arg(packet);
+        }
+
+        void XrayFinalmask(Validation::Issues& issues, const QString& at, const QJsonObject& finalmask, bool resolversReplaced)
+        {
+            auto copy = finalmask;
+            QString udpAt = at + "udp";
+            const auto udp = xrayStreamLast(xrayStreamRoot(copy, at), QStringLiteral("udp"), true, &udpAt).toArray();
+            qsizetype xdns = -1;
+            bool reported = false;
+            for (qsizetype i = 0; i < udp.size(); ++i) {
+                const auto type = xrayMaskType(udp.at(i));
+                if (xdns >= 0 && !reported && type != "filter") {
+                    // xdns dials its resolvers itself, so the masks Xray stacks under it never see a packet.
+                    xrayStreamAdd(issues, Validation::Severity::Error, QStringLiteral("%1[%2].type").arg(udpAt).arg(xdns),
+                                  QCoreApplication::translate("Validation", "The xdns mask must be the last udp mask: it sends the DNS queries itself, so Xray skips the masks after it."));
+                    reported = true;
+                }
+                if (type != "xdns") continue;
+                if (xdns < 0) xdns = i;
+                xrayXdnsIssues(issues, QStringLiteral("%1[%2].").arg(udpAt).arg(i), udp.at(i).toObject(), resolversReplaced);
+            }
+        }
+    }
+
+    void xrayStreamSetting::Validate(Validation::Issues& issues, const QString& serverAddress)
+    {
+        using Validation::Severity;
+        const QString root = QStringLiteral("streamSettings.");
+        xrayStreamAdd(issues, Severity::Error, root + "network", Checks::XrayNetwork(network), network);
+        xrayStreamAdd(issues, Severity::Error, root + "security", Checks::XraySecurity(security), security);
+        xrayStreamAdd(issues, Severity::Error, root + "security", Checks::XrayRealityNetwork(security, network));
+
+        const auto mode = security.trimmed().toLower();
+        if (mode == "tls") {
+            const QString key = root + "tlsSettings.";
+            const auto fingerprint = TLS->fingerprint.isEmpty() ? Configs::dataManager->settingsRepo->utlsFingerprint : TLS->fingerprint;
+            xrayStreamAdd(issues, Severity::Warning, key + "serverName", Checks::ServerName(TLS->serverName), TLS->serverName);
+            xrayStreamAdd(issues, Severity::Error, key + "fingerprint", Checks::XrayFingerprint(TLS->fingerprint, false), TLS->fingerprint);
+            xrayStreamAdd(issues, Severity::Error, key + "pinnedPeerCertSha256", Checks::XrayPinnedSha256(TLS->pinnedPeerCertSha256));
+            xrayStreamAdd(issues, Severity::Warning, key + "cipherSuites", Checks::XrayCipherSuites(TLS->cipherSuites));
+            xrayStreamAdd(issues, Severity::Warning, key + "cipherSuites", Checks::XrayCipherSuitesNeedUnsafe(TLS->cipherSuites, fingerprint));
+            xrayStreamAdd(issues, Severity::Warning, key + "echConfigList",
+                          Checks::XrayEchConfigList(TLS->echConfigList, TLS->serverName.isEmpty() ? serverAddress : TLS->serverName));
+        } else if (mode == "reality") {
+            const QString key = root + "realitySettings.";
+            xrayStreamAdd(issues, Severity::Warning, key + "serverName", Checks::ServerName(reality->serverName), reality->serverName);
+            xrayStreamAdd(issues, Severity::Error, key + "fingerprint", Checks::XrayFingerprint(reality->fingerprint, true), reality->fingerprint);
+            xrayStreamAdd(issues, Severity::Error, key + "password", Checks::RealityPublicKey(reality->password, true));
+            xrayStreamAdd(issues, Severity::Error, key + "shortId", Checks::RealityShortId(reality->shortId));
+            xrayStreamAdd(issues, Severity::Error, key + "spiderX", Checks::XraySpiderX(reality->spiderX), reality->spiderX);
+            xrayStreamAdd(issues, Severity::Error, key + "mldsa65Verify", Checks::XrayMldsa65Verify(reality->mldsa65Verify));
+        }
+
+        const bool xdns = IsXdns();
+        Checks::XrayFinalmask(issues, root + "finalmask.", finalmask, xdns && !xdnsResolvers.IsEmpty());
+        if (xdns) {
+            for (const auto& line : xdnsResolvers.lines) {
+                if (const auto message = Checks::XdnsResolverLine(line); !message.isEmpty()) {
+                    xrayStreamAdd(issues, Severity::Error, root + "xdnsResolvers", message, line.trimmed());
+                    break;
+                }
+            }
+        }
+        const auto net = NormalizeXrayNetwork(network);
+        if (net == "httpupgrade") {
+            xrayStreamAdd(issues, Severity::Error, root + "httpupgradeSettings.headers", Checks::XrayHeadersHost(httpupgrade->headers));
+        }
+        if (net == "kcp") {
+            for (const auto& value : kXrayKCPValues) {
+                const auto text = QString::number(kcp.get()->*value.field);
+                xrayStreamAdd(issues, Severity::Error, root + "kcpSettings." + value.key, xrayKCPCheck(value.key, text, kcp->mtu), text);
+            }
+        }
+        if (net == "xdrive") {
+            const auto& d = *xdrive;
+            const QString key = root + "xdriveSettings.";
+            const auto frontPort = d.frontPort == 0 ? QString() : QString::number(d.frontPort);
+            xrayStreamAdd(issues, Severity::Error, key + "service", Checks::XrayXDriveService(d.service), d.service);
+            xrayStreamAdd(issues, Severity::Error, key + "remoteFolder", Checks::XrayXDriveFolder(d.service, d.remoteFolder));
+            xrayStreamAdd(issues, Severity::Error, key + "secrets", Checks::XrayXDriveSecrets(d.service, d.secrets));
+            xrayStreamAdd(issues, Severity::Error, key + "template", Checks::XrayXDriveTemplate(d.service, d.templateSpec));
+            xrayStreamAdd(issues, Severity::Error, key + "s3.endpoint", Checks::XrayXDriveS3Endpoint(d.service, d.s3Endpoint), d.s3Endpoint);
+            xrayStreamAdd(issues, Severity::Error, key + "s3.region", Checks::XrayXDriveS3Region(d.service, d.s3Region), d.s3Region);
+            xrayStreamAdd(issues, Severity::Error, key + "s3.bucket", Checks::XrayXDriveS3Bucket(d.service, d.s3Bucket, d.s3Endpoint, d.s3PathStyle), d.s3Bucket);
+            for (const auto& [name, field] : xdriveTuning()) {
+                const auto value = QString::number(d.*field);
+                xrayStreamAdd(issues, Severity::Error, key + name, Checks::XrayXDriveTuning(value), value);
+            }
+            xrayStreamAdd(issues, Severity::Error, root + "port", Checks::XrayXDriveFrontPort(frontPort), frontPort);
+            xrayStreamAdd(issues, Severity::Warning, root + "port", Checks::XrayXDriveFrontPortAlone(d.frontAddress, frontPort), frontPort);
+            return;
+        }
+        if (net != "xhttp") return;
+        const auto& x = *xhttp;
+        const QString extra = root + "xhttpSettings.extra.";
+        xrayStreamAdd(issues, Severity::Error, root + "xhttpSettings.mode", Checks::XrayXHTTPMode(x.mode), x.mode);
+        xrayStreamAdd(issues, Severity::Error, extra + "headers", Checks::XrayHeadersHost(x.headers));
+        xrayStreamAdd(issues, Severity::Error, extra + "xPaddingBytes", Checks::XrayXPaddingBytes(x.xPaddingBytes), x.xPaddingBytes);
+        xrayStreamAdd(issues, Severity::Error, extra + "xPaddingMethod", Checks::XrayPaddingMethod(x.xPaddingMethod), x.xPaddingMethod);
+        xrayStreamAdd(issues, Severity::Error, extra + "xPaddingPlacement", Checks::XrayPaddingPlacement(x.xPaddingPlacement), x.xPaddingPlacement);
+        xrayStreamAdd(issues, Severity::Error, extra + "uplinkHTTPMethod", Checks::XrayUplinkMethod(x.uplinkHTTPMethod, x.mode), x.uplinkHTTPMethod);
+        xrayStreamAdd(issues, Severity::Warning, extra + "uplinkHTTPMethod", Validation::HttpToken(x.uplinkHTTPMethod), x.uplinkHTTPMethod);
+        xrayStreamAdd(issues, Severity::Error, extra + "uplinkDataPlacement", Checks::XrayUplinkDataPlacement(x.uplinkDataPlacement, x.mode), x.uplinkDataPlacement);
+        xrayStreamAdd(issues, Severity::Error, extra + "sessionIDPlacement", Checks::XrayMetaPlacement(x.sessionIDPlacement), x.sessionIDPlacement);
+        xrayStreamAdd(issues, Severity::Error, extra + "seqPlacement", Checks::XrayMetaPlacement(x.seqPlacement), x.seqPlacement);
+        xrayStreamAdd(issues, Severity::Error, extra + "sessionIDTable", Checks::XraySessionId(x.sessionIDTable, x.sessionIDLength));
+        if (x.serverMaxHeaderBytes < 0) {
+            xrayStreamAdd(issues, Severity::Error, extra + "serverMaxHeaderBytes", Validation::Int(QString::number(x.serverMaxHeaderBytes), 0, INT_MAX));
+        }
+        for (const auto& [name, value] : {std::pair{QStringLiteral("sessionIDLength"), x.sessionIDLength},
+                                          std::pair{QStringLiteral("uplinkChunkSize"), x.uplinkChunkSize},
+                                          std::pair{QStringLiteral("scMaxEachPostBytes"), x.scMaxEachPostBytes},
+                                          std::pair{QStringLiteral("scMinPostsIntervalMs"), x.scMinPostsIntervalMs},
+                                          std::pair{QStringLiteral("scStreamUpServerSecs"), x.scStreamUpServerSecs},
+                                          std::pair{QStringLiteral("xmux.maxConcurrency"), x.maxConcurrency},
+                                          std::pair{QStringLiteral("xmux.maxConnections"), x.maxConnections},
+                                          std::pair{QStringLiteral("xmux.cMaxReuseTimes"), x.cMaxReuseTimes},
+                                          std::pair{QStringLiteral("xmux.hMaxRequestTimes"), x.hMaxRequestTimes},
+                                          std::pair{QStringLiteral("xmux.hMaxReusableSecs"), x.hMaxReusableSecs}}) {
+            xrayStreamAdd(issues, Severity::Error, extra + name, Checks::XrayInt32Range(value), value);
+        }
+        xrayStreamAdd(issues, Severity::Error, extra + "xmux.maxConnections", Checks::XrayXmuxExclusive(x.maxConnections, x.maxConcurrency));
+        Checks::XrayXHTTPDownloadLeg(issues, {}, QJsonObject{{"streamSettings", QJsonObject{{"network", "xhttp"}, {"xhttpSettings", xhttp->ExportToJson()}}}});
     }
 }

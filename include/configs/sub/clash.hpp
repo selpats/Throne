@@ -18,8 +18,10 @@ struct MyInt {
     operator int() const { return value; }
 };
 
+// A string is base64, as mihomo decodes it into []uint8; `text` keeps a value that decodes to no byte list.
 struct WgReserved {
-    std::vector<uint8_t> value;
+    std::vector<int> value;
+    std::string text;
 };
 
 struct smuxOpts {
@@ -68,17 +70,21 @@ struct xhttpReuseSettings {
     std::string h_keep_alive_period;
 };
 
+// The optional values, when unset, take the proxy's own, as mihomo does.
 struct xhttpDownloadSettings {
-    std::string host;
-    std::string path;
+    std::optional<std::string> host;
+    std::optional<std::string> path;
+    std::optional<std::map<std::string, std::string>> headers;
     std::string mode;
-    std::string server;
-    MyInt port;
-    MyBool tls;
-    std::vector<std::string> alpn;
-    std::string servername;
-    std::string client_fingerprint;
-    realityOpts reality_opts;
+    std::optional<std::string> server;
+    std::optional<MyInt> port;
+    std::optional<MyBool> tls;
+    std::optional<std::vector<std::string>> alpn;
+    std::optional<std::string> servername;
+    std::optional<std::string> client_fingerprint;
+    // The certificate pin.
+    std::optional<std::string> fingerprint;
+    std::optional<realityOpts> reality_opts;
     MyBool x_padding_obfs_mode;
     std::string x_padding_key;
     std::string x_padding_header;
@@ -91,11 +97,25 @@ struct xhttpOpts {
     std::string host;
     std::string path;
     std::string mode;
+    std::map<std::string, std::string> headers;
+    MyBool no_grpc_header;
+    std::string x_padding_bytes;
     MyBool x_padding_obfs_mode;
     std::string x_padding_key;
     std::string x_padding_header;
     std::string x_padding_placement;
     std::string x_padding_method;
+    std::string uplink_http_method;
+    std::string session_placement;
+    std::string session_key;
+    std::string session_table;
+    std::string session_length;
+    std::string seq_placement;
+    std::string seq_key;
+    std::string uplink_data_placement;
+    std::string uplink_data_key;
+    std::string uplink_chunk_size;
+    std::string sc_max_each_post_bytes;
     std::string sc_min_posts_interval_ms;
     xhttpReuseSettings reuse_settings;
     bool has_download_settings = false;
@@ -126,6 +146,35 @@ struct wgPeer {
     std::vector<std::string> allowed_ips;
 };
 
+// Numbers are kept as text so the WireGuard parser can validate them like its link counterparts.
+struct wgAmneziaOpts {
+    std::string jc;
+    std::string jmin;
+    std::string jmax;
+    std::string s1;
+    std::string s2;
+    std::string s3;
+    std::string s4;
+    std::string h1;
+    std::string h2;
+    std::string h3;
+    std::string h4;
+    std::string i1;
+    std::string i2;
+    std::string i3;
+    std::string i4;
+    std::string i5;
+    std::string header_protection_key;
+    std::string content_padding_addition;
+    std::string rekey_after_time;
+    std::string rekey_timeout;
+    std::string reject_after_time;
+    std::string keepalive_timeout;
+    std::string max_handshake_attempts;
+    MyBool random_trailers;
+    MyBool disable_cookies;
+};
+
 struct Proxies {
     std::string name;
     std::string type;
@@ -150,7 +199,8 @@ struct Proxies {
     std::string sni;
     std::vector<std::string> alpn;
     std::string plugin;
-    fkyaml::node plugin_opts;
+    // Decoded by `plugin` as mihomo's ss adapter does: all fields for v2ray-plugin, mode and host for obfs.
+    v2rayPlugin plugin_opts;
     std::string fingerprint;
     std::string obfs;
     std::string protocol;
@@ -185,6 +235,14 @@ struct Proxies {
     std::optional<WgReserved> reserved;
     std::string dialer_proxy;
     std::vector<wgPeer> peers;
+    MyInt workers;
+    std::string persistent_keepalive;
+    std::string keepalive;
+    std::optional<wgAmneziaOpts> amnezia_wg_option;
+    // GFW-knocker Xray's WireGuard noise, which converters copy into Clash entries.
+    std::string wnoise;
+    std::string wnoisecount;
+    std::string wpayloadsize;
     MyInt mtu;
     MyBool disable_sni;
     std::string congestion_controller;
@@ -223,6 +281,7 @@ void from_node(const fkyaml::node& node, realityOpts& opts);
 void from_node(const fkyaml::node& node, obfs& opts);
 void from_node(const fkyaml::node& node, v2rayPlugin& opts);
 void from_node(const fkyaml::node& node, wgPeer& peer);
+void from_node(const fkyaml::node& node, wgAmneziaOpts& opts);
 void from_node(const fkyaml::node& node, Proxies& p);
 void from_node(const fkyaml::node& node, Clash& c);
 

@@ -46,14 +46,30 @@
           </property>
          </widget>
         </item>
-        <item row="1" column="0">
+        <item row="0" column="3">
+         <spacer name="processGap">
+          <property name="orientation">
+           <enum>Qt::Orientation::Horizontal</enum>
+          </property>
+          <property name="sizeType">
+           <enum>QSizePolicy::Policy::Fixed</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>12</width>
+            <height>0</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
+        <item row="0" column="4">
          <widget class="QLabel" name="labelCoreName">
           <property name="text">
            <string>Core</string>
           </property>
          </widget>
         </item>
-        <item row="1" column="1">
+        <item row="0" column="5">
          <widget class="QLabel" name="vCoreCpu">
           <property name="text">
            <string notr="true">—</string>
@@ -63,7 +79,7 @@
           </property>
          </widget>
         </item>
-        <item row="1" column="2">
+        <item row="0" column="6">
          <widget class="QLabel" name="vCoreRam">
           <property name="text">
            <string notr="true">—</string>
@@ -73,7 +89,7 @@
           </property>
          </widget>
         </item>
-        <item row="0" column="3" rowspan="2">
+        <item row="0" column="7">
          <spacer name="tableSpacer">
           <property name="orientation">
            <enum>Qt::Orientation::Horizontal</enum>
@@ -90,26 +106,6 @@
       </item>
       <item>
        <layout class="QHBoxLayout" name="chartsRow">
-        <item>
-         <widget class="MiniChartWidget" name="cpuChart" native="true">
-          <property name="minimumSize">
-           <size>
-            <width>0</width>
-            <height>100</height>
-           </size>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="MiniChartWidget" name="ramChart" native="true">
-          <property name="minimumSize">
-           <size>
-            <width>0</width>
-            <height>100</height>
-           </size>
-          </property>
-         </widget>
-        </item>
        </layout>
       </item>
      </layout>
@@ -154,7 +150,7 @@
         <item row="3" column="2">
          <widget class="QLabel" name="labelOutIp">
           <property name="text">
-           <string>Out IP</string>
+           <string>Exit IP</string>
           </property>
          </widget>
         </item>
@@ -181,6 +177,54 @@
            <string>Ping</string>
           </property>
          </widget>
+        </item>
+        <item row="4" column="0">
+         <widget class="QLabel" name="labelServices">
+          <property name="text">
+           <string>Services</string>
+          </property>
+         </widget>
+        </item>
+        <item row="4" column="1" colspan="3">
+         <layout class="QHBoxLayout" name="servicesLayout" stretch="1,0,0,0">
+          <item>
+           <widget class="QLabel" name="vServices">
+            <property name="text">
+             <string notr="true">—</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="btnServiceCheck">
+            <property name="text">
+             <string>Check</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="vServiceChecked">
+            <property name="text">
+             <string notr="true"/>
+            </property>
+            <property name="colorRole" stdset="0">
+             <string notr="true">muted</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="servicesSpacer">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>0</width>
+              <height>0</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+         </layout>
         </item>
        </layout>
       </item>
@@ -434,7 +478,7 @@
       <item row="0" column="9">
        <widget class="QLabel" name="labelRouteUpdate">
         <property name="text">
-         <string>Next remote route update</string>
+         <string>Next remote routing profile update</string>
         </property>
        </widget>
       </item>
@@ -463,14 +507,6 @@
    </item>
   </layout>
  </widget>
- <customwidgets>
-  <customwidget>
-   <class>MiniChartWidget</class>
-   <extends>QWidget</extends>
-   <header>include/ui/stats/MiniChartWidget.h</header>
-   <container>1</container>
-  </customwidget>
- </customwidgets>
  <resources/>
  <connections/>
 </ui>

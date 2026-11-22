@@ -3,9 +3,10 @@
 
 #include "include/api/RPC.h"
 #include "include/database/ProfilesRepo.h"
+#include "include/database/entities/RouteProfile.h"
+#include "include/engine/Lifecycle.h"
 #include "include/global/Configs.hpp"
 #include "include/global/Logger.hpp"
-#include "include/ui/mainwindow.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -45,9 +46,10 @@ namespace {
 
     QByteArray clientInfo() {
         const auto *settings = Configs::dataManager->settingsRepo.get();
+        const int startedId = Engine::Lifecycle::ResumeTargetId();
         QString profileType;
-        if (settings->started_id >= 0) {
-            if (const auto profile = Configs::dataManager->profilesRepo->GetProfile(settings->started_id))
+        if (startedId >= 0) {
+            if (const auto profile = Configs::dataManager->profilesRepo->GetProfile(startedId))
                 profileType = profile->type;
         }
 
@@ -59,7 +61,7 @@ namespace {
         info["kernel"] = QStringLiteral("%1 %2").arg(QSysInfo::kernelType(), QSysInfo::kernelVersion());
         info["cpu_arch"] = QSysInfo::currentCpuArchitecture();
         info["core_running"] = settings->core_running;
-        info["proxy_running"] = settings->started_id >= 0;
+        info["proxy_running"] = Engine::Lifecycle::RunningProfileId() >= 0;
         info["running_profile_type"] = profileType;
         info["tun"] = settings->spmode_vpn;
         info["system_proxy"] = settings->spmode_system_proxy;
@@ -67,7 +69,9 @@ namespace {
         info["traffic_stats"] = !settings->disable_traffic_stats;
         info["traffic_aggregation"] = !settings->disable_traffic_aggregation;
         info["resolve_domain_strategy"] = settings->resolve_domain_strategy;
-        info["fake_dns"] = settings->fake_dns;
+        bool routeOwnsDns = false;
+        info["fake_dns"] = Configs::RouteDns::Current(&routeOwnsDns).fake_dns;
+        info["route_custom_dns"] = routeOwnsDns;
         info["enable_tun_routing"] = settings->enable_tun_routing;
         return QJsonDocument(info).toJson();
     }
@@ -116,6 +120,10 @@ namespace Sys {
     }
 
     void CoreDiagnostics::showInFolder(const QString &path) {
+        if (!IsGuiApp()) {
+            LOG_DEBUG(QString("diagnostics: show in folder skipped without a GUI: %1").arg(path));
+            return;
+        }
         const QFileInfo file(path);
         if (path.isEmpty() || !file.isFile()) {
             openDirectory();
@@ -132,6 +140,10 @@ namespace Sys {
     }
 
     void CoreDiagnostics::openDirectory() {
+        if (!IsGuiApp()) {
+            LOG_DEBUG("diagnostics: open directory skipped without a GUI");
+            return;
+        }
         const QString dir = directory();
         QDir().mkpath(dir);
         QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
@@ -256,9 +268,13 @@ namespace Sys {
     }
 
     void CoreDiagnostics::notify(bool saved, const QString &text, const QString &path) {
+        if (!IsGuiApp()) {
+            LOG_DEBUG(QString("diagnostics: notice skipped without a GUI: %1").arg(text));
+            return;
+        }
         if (notice_) notice_->close();
         auto *box = new QMessageBox(saved ? QMessageBox::Information : QMessageBox::Warning,
-                                    tr("Performance profile"), text, QMessageBox::NoButton, GetMainWindow());
+                                    tr("Performance profile"), text, QMessageBox::NoButton, mainwindow);
         box->setAttribute(Qt::WA_DeleteOnClose);
         box->setWindowModality(Qt::NonModal);
         if (saved) {

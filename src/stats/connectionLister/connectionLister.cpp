@@ -1,8 +1,11 @@
 #include <QThread>
 #include <QDateTime>
+#include <QObject>
 #include <core/gen/libcore.pb.h>
 #include <include/api/RPC.h>
-#include "include/ui/mainwindow_interface.h"
+#include "include/database/DatabaseManager.h"
+#include "include/global/Utils.hpp"
+#include "include/stats/StatsSink.hpp"
 #include <include/stats/connections/connectionLister.hpp>
 #include "include/stats/traffic/TrafficStatsManager.hpp"
 #include "include/global/LocalNetwork.hpp"
@@ -39,7 +42,7 @@ namespace Stats
             bool forced = false;
             {
                 QMutexLocker wlk(&waitMu_);
-                if (!forced_) waitCond_.wait(&waitMu_, inView_.load() ? kActivePollMs : kRelaxedPollMs);
+                if (!forced_) waitCond_.wait(&waitMu_, inView_.load() || apiWatch_.load() ? kActivePollMs : kRelaxedPollMs);
                 forced = forced_;
                 forced_ = false;
             }
@@ -49,7 +52,7 @@ namespace Stats
             if (!forced && (suspend || !Configs::dataManager->settingsRepo->enable_stats)) continue;
 
             mu.lock();
-            update(forced || inView_.load());
+            update(forced || inView_.load(), apiWatch_.load());
             mu.unlock();
         }
     }
@@ -64,6 +67,21 @@ namespace Stats
         }
     }
 
+    void ConnectionLister::SetApiWatch(bool watch)
+    {
+        const bool was = apiWatch_.exchange(watch);
+        if (watch && !was)
+        {
+            QMutexLocker wlk(&waitMu_);
+            waitCond_.wakeAll();
+        }
+    }
+
+    void ConnectionLister::SetApiSink(ApiSink sink)
+    {
+        apiSink_ = std::move(sink);
+    }
+
     QString EndpointHost(const QString& endpoint)
     {
         if (endpoint.startsWith('['))
@@ -75,7 +93,14 @@ namespace Stats
         return colon < 0 ? endpoint : endpoint.left(colon);
     }
 
-    static ConnectionMetadata metaFromProto(const libcore::ConnectionMetaData& conn, const QString& localLabel)
+    void ConnectionLister::SetOutboundNames(const QHash<QString, QString>& names)
+    {
+        QMutexLocker lk(&namesMu_);
+        outboundNames_ = names;
+    }
+
+    static ConnectionMetadata metaFromProto(const libcore::ConnectionMetaData& conn, const QString& localLabel,
+                                            const QHash<QString, QString>& outboundNames)
     {
         ConnectionMetadata c;
         c.id = QString::fromStdString(conn.id.value());
@@ -86,14 +111,19 @@ namespace Stats
         c.domain = QString::fromStdString(conn.domain.value());
         c.network = QString::fromStdString(conn.network.value());
         c.outbound = QString::fromStdString(conn.outbound.value());
+        c.outboundName = outboundNames.value(c.outbound);
+        if (c.outboundName.isEmpty()) c.outboundName = c.outbound;
         c.process = QString::fromStdString(conn.process.value());
         c.processPath = QString::fromStdString(conn.process_path.value());
         c.protocol = QString::fromStdString(conn.protocol.value());
         c.closedAtMs = conn.closed_at.value();
+        c.rule = QString::fromStdString(conn.rule.value());
+        c.ruleItem = QString::fromStdString(conn.rule_item.value());
         c.source = QString::fromStdString(conn.source.value());
         // In tun mode our own traffic enters with the tun's (or this machine's LAN) address, so a loopback-only test would label it a LAN client.
         const QString host = EndpointHost(c.source);
-        c.sourceDisplay = host.isEmpty() || LocalNetwork::IsOwnAddress(host) ? localLabel : host;
+        c.sourceLocal = host.isEmpty() || LocalNetwork::IsOwnAddress(host);
+        c.sourceDisplay = c.sourceLocal ? localLabel : host;
         return c;
     }
 
@@ -124,6 +154,16 @@ namespace Stats
                 return asc ? ka > kb : ka < kb;
             });
         }
+
+        void sortApiSnapshot(QList<ConnectionMetadata>& list)
+        {
+            std::sort(list.begin(), list.end(), [](const ConnectionMetadata& a, const ConnectionMetadata& b)
+            {
+                if ((a.closedAtMs == 0) != (b.closedAtMs == 0)) return a.closedAtMs == 0;
+                if (a.createdAtMs != b.createdAtMs) return a.createdAtMs > b.createdAtMs;
+                return a.id < b.id;
+            });
+        }
     }
 
     bool SortIsDescending(const ConnectionSort sort, const bool ascending)
@@ -142,11 +182,16 @@ namespace Stats
         }
     }
 
-    void ConnectionLister::update(const bool pushToUi)
+    void ConnectionLister::update(const bool pushToUi, const bool pushToApi)
     {
         libcore::QueryConnectionsResp resp = API::defaultClient->QueryConnections();
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
         const QString localLabel = QObject::tr("Local");
+        QHash<QString, QString> outboundNames;
+        {
+            QMutexLocker lk(&namesMu_);
+            outboundNames = outboundNames_;
+        }
 
         QList<ConnectionMetadata> rows;
         rows.reserve(static_cast<qsizetype>(resp.active.size()));
@@ -155,7 +200,7 @@ namespace Stats
 
         for (const auto& conn : resp.active)
         {
-            auto c = metaFromProto(conn, localLabel);
+            auto c = metaFromProto(conn, localLabel, outboundNames);
 
             SpeedSample s;
             if (const auto it = speedSamples_.constFind(c.id); it != speedSamples_.constEnd())
@@ -235,6 +280,25 @@ namespace Stats
             accountedClosed_ = currentClosed; // everything in the ring is accounted
         }
 
+        if (pushToApi)
+        {
+            QList<ConnectionMetadata> apiRows = rows;
+            QSet<QString> openIds;
+            openIds.reserve(rows.size());
+            for (const auto& row : rows) openIds.insert(row.id);
+            for (const auto& conn : resp.closed)
+            {
+                auto c = metaFromProto(conn, localLabel, outboundNames);
+                // A connection that closed while the core listed it shows up in both lists.
+                if (!openIds.contains(c.id)) apiRows.append(std::move(c));
+            }
+            sortApiSnapshot(apiRows);
+            if (apiRows.size() > kSnapshotMaxRows) apiRows.resize(kSnapshotMaxRows);
+            runOnUiThread([this, apiRows = std::move(apiRows), nowMs] {
+                if (apiSink_) apiSink_(apiRows, nowMs);
+            });
+        }
+
         if (!pushToUi) return;
 
         switch (sort)
@@ -265,7 +329,7 @@ namespace Stats
             sortSmallestFirst(rows, asc, [](const ConnectionMetadata& c) -> const QString& { return c.process; });
             break;
         case ByOutbound:
-            sortSmallestFirst(rows, asc, [](const ConnectionMetadata& c) -> const QString& { return c.outbound; });
+            sortSmallestFirst(rows, asc, [](const ConnectionMetadata& c) -> const QString& { return c.outboundName; });
             break;
         case ByProtocol:
             sortSmallestFirst(rows, asc, [](const ConnectionMetadata& c) -> const QString& { return c.protocol; });
@@ -276,7 +340,7 @@ namespace Stats
         }
 
         runOnUiThread([rows = std::move(rows)] {
-            if (auto* m = GetMainWindow()) m->UpdateConnectionList(rows);
+            if (auto* sink = CurrentStatsSink()) sink->onConnections(rows);
         });
     }
 
