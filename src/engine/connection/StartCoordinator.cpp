@@ -268,7 +268,8 @@ namespace Engine {
                 if (error.contains("configure tun interface")) {
                     finish(StartOutcome::TunFailed, error);
                     if (!resolved.interactive) return false;
-                    if (error.contains("open existing adapter")) {
+                    if (error.contains("open existing adapter") ||
+                        error.contains("Cannot create a file when that file already exists")) {
                         runOnUiThread([=, this] {
                             policy()->offerLeftoverTunAdapterRetry(error, [=, this, self = QPointer<StartCoordinator>(this)](bool retry) {
                                 if (!retry || !self) return;
@@ -361,8 +362,8 @@ namespace Engine {
 
         if (kStartCoordinatorLinux && m_options.headless && Configs::dataManager->settingsRepo->spmode_vpn) startCoordinatorWarnTunApiReach();
 
-        // Wintun spends 15 s on a leftover adapter before failing; a restart from the prompt inside that window strands a new one.
-        const int slowStartMs = kStartCoordinatorWindows && !result->tunIPv4CIDR.isEmpty() ? 20000 : 10000;
+        // Wintun spends up to 15 s on a leftover adapter per attempt, and the core retries automatically before failing.
+        const int slowStartMs = kStartCoordinatorWindows && !result->tunIPv4CIDR.isEmpty() ? 40000 : 10000;
         const Engine::SlowOperation slowStart = resolved.interactive
             ? policy()->slowOperation(Engine::SlowOperationKind::Start, slowStartMs)
             : Engine::SlowOperation{};

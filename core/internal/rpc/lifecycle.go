@@ -20,6 +20,22 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
+func isWindowsTransientTunError(err error) bool {
+	if runtime.GOOS != "windows" || err == nil {
+		return false
+	}
+	return isTransientTunErrorMessage(err.Error())
+}
+
+func isTransientTunErrorMessage(msg string) bool {
+	if !strings.Contains(msg, "configure tun interface") {
+		return false
+	}
+	return strings.Contains(msg, "Cannot create a file when that file already exists") ||
+		strings.Contains(msg, "open existing adapter") ||
+		strings.Contains(msg, "The system cannot find the file specified")
+}
+
 func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.ErrorResp, _ error) {
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
@@ -116,17 +132,38 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 
 	var routeRules []option.Rule
 	var xrayTunnelHops map[string]int
-	box, cancel, err := boxmain.Create([]byte(*in.CoreConfig), stack.PublishBoxContext, func(options *option.Options) {
-		if options.Route != nil {
-			routeRules = options.Route.Rules
+	const maxWinTunRetries = 2
+	var box *boxmain.Box
+	var cancel context.CancelFunc
+	for attempt := 0; ; attempt++ {
+		routeRules = nil
+		xrayTunnelHops = nil
+		box, cancel, err = boxmain.Create([]byte(*in.CoreConfig), stack.PublishBoxContext, func(options *option.Options) {
+			if options.Route != nil {
+				routeRules = options.Route.Rules
+			}
+			if systemDNS {
+				sysdns.AdjustInbound(options)
+			}
+			if in.GetNeedXray() {
+				xrayTunnelHops = probe.XrayDNSTunnelHops(options, in.GetXrayConfig())
+			}
+		})
+		if err == nil || attempt >= maxWinTunRetries || !isWindowsTransientTunError(err) {
+			break
 		}
-		if systemDNS {
-			sysdns.AdjustInbound(options)
+		log.Printf("TUN adapter is being cleaned up by Windows (%v), retrying in 2s (%d/%d)...", err, attempt+1, maxWinTunRetries)
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			err = ctx.Err()
+		case <-timer.C:
 		}
-		if in.GetNeedXray() {
-			xrayTunnelHops = probe.XrayDNSTunnelHops(options, in.GetXrayConfig())
+		if ctx.Err() != nil {
+			break
 		}
-	})
+	}
 	if err != nil {
 		stopSidecars()
 		return
